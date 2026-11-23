@@ -8,6 +8,7 @@ import {
   SignedInDevice,
   VaultHealthSummary,
 } from "../types/vault";
+import { formatRelativeTime } from "../lib/vaultUtils";
 import { DeviceIcon, DownloadIcon } from "./Icons";
 
 interface SecurityCenterViewProps {
@@ -24,8 +25,11 @@ interface SecurityCenterViewProps {
   onSignOutDevice: (deviceId: string) => void;
   onSignOutOthers: () => void;
   onOpenRecoveryKey: () => void;
+  onOpenChangePassword: () => void;
   onOpenExportBackup: () => void;
   onViewAllActivity: () => void;
+  /** epoch ms of the last recovery-key rotation, from vault_keys */
+  recoveryKeyRotatedAt: number | null;
 }
 
 export function SecurityCenterView({
@@ -39,8 +43,10 @@ export function SecurityCenterView({
   onSignOutDevice,
   onSignOutOthers,
   onOpenRecoveryKey,
+  onOpenChangePassword,
   onOpenExportBackup,
   onViewAllActivity,
+  recoveryKeyRotatedAt,
 }: SecurityCenterViewProps) {
   const toggleRows: {
     key: keyof Omit<SecuritySettings, "autoLockMinutes">;
@@ -65,7 +71,7 @@ export function SecurityCenterView({
     {
       key: "twoStepLogin",
       title: "Two-step login for Conserve",
-      description: "Authenticator code on every new device.",
+      description: "Authenticator app code at every sign-in.",
     },
     {
       key: "emailNewSignIns",
@@ -353,7 +359,9 @@ export function SecurityCenterView({
             </h2>
             <p className="text-[12.5px] text-[#737373] mt-1.5 leading-relaxed">
               Your recovery key is the only way back in if you forget your
-              master password. Last confirmed 2 months ago.
+              master password.
+              {recoveryKeyRotatedAt !== null &&
+                ` Last rotated ${formatRelativeTime(recoveryKeyRotatedAt).toLowerCase()}.`}
             </p>
             <div className="mt-4 flex flex-col sm:flex-row sm:flex-wrap items-stretch sm:items-center gap-2.5">
               <button
@@ -362,6 +370,13 @@ export function SecurityCenterView({
                 className="w-full sm:w-auto justify-center inline-flex items-center px-4 py-2.5 sm:py-2 rounded-xl bg-[#0D0D0D] text-white text-[13px] font-medium hover:bg-[#262626] active:scale-[0.98] transition-all cursor-pointer"
               >
                 New recovery key
+              </button>
+              <button
+                type="button"
+                onClick={onOpenChangePassword}
+                className="w-full sm:w-auto justify-center inline-flex items-center px-4 py-2.5 sm:py-2 rounded-xl border border-[#E5E5E5] bg-white text-[13px] font-medium text-[#111111] hover:bg-[#F5F5F5] active:scale-[0.98] transition-all cursor-pointer"
+              >
+                Change master password
               </button>
               <button
                 type="button"

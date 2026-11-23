@@ -5,10 +5,12 @@ import { ActivityLogView } from "./components/ActivityLogView";
 import { AuthScreen } from "./components/AuthScreen";
 import {
   AccountModal,
+  ChangeMasterPasswordModal,
   DeleteAccountModal,
   ExportBackupModal,
   ReauthModal,
   RecoveryKeyModal,
+  TwoStepModal,
 } from "./components/Modals";
 import { SecurityCenterView } from "./components/SecurityCenterView";
 import { Sidebar } from "./components/Sidebar";
@@ -18,24 +20,34 @@ import { computeVaultHealth, generateMonogram } from "./lib/vaultUtils";
 import {
   UnlockedVault,
   buildEncryptedBackup,
+  cancelTotpEnrollment,
+  changeMasterPassword,
+  completeRecovery,
+  confirmTotpEnrollment,
   deleteAccount,
+  disableTotp,
   getSessionEmail,
+  isTotpEnabled,
   loadAccounts,
   loadDevices,
   loadLogs,
   loadSettings,
   logEvent,
-  recoverWithKey,
+  openVault,
   registerCurrentDevice,
   registerVault,
   revokeDevice,
   revokeOtherDevices,
+  requestReauthentication,
   rotateRecoveryKey,
   saveAccount,
   sendRecoveryCode,
-  unlockWithPassword,
+  signInForVault,
+  startTotpEnrollment,
   updateSetting,
   verifyMasterPassword,
+  verifyRecoveryCode,
+  verifyTotp,
 } from "./lib/vaultService";
 import {
   AuditCategory,
@@ -59,6 +71,17 @@ const DEFAULT_SETTINGS: SecuritySettings = {
 };
 
 type UnlockMethod = "password" | "register" | "recovery";
+
+/** Actions that expose a secret and need a recent master-password check. */
+type GuardedAction =
+  | { kind: "reveal" | "copy" | "edit"; account: GameAccount }
+  | { kind: "rotate" };
+
+const REAUTH_WINDOW_MS = 5 * 60 * 1000;
+
+function reauthExpired(lastVerifiedAt: number): boolean {
+  return Date.now() - lastVerifiedAt >= REAUTH_WINDOW_MS;
+}
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : "Something went wrong.";
@@ -98,11 +121,16 @@ export default function Home() {
   const [accountModalOpen, setAccountModalOpen] = useState(false);
   const [editingAccount, setEditingAccount] = useState<GameAccount | null>(null);
   const [deletingAccount, setDeletingAccount] = useState<GameAccount | null>(null);
-  const [pendingRevealAccount, setPendingRevealAccount] = useState<GameAccount | null>(null);
+  const [pendingAction, setPendingAction] = useState<GuardedAction | null>(null);
   const [recoveryModalOpen, setRecoveryModalOpen] = useState(false);
   /** Freshly generated recovery key — shown once, then discarded. */
   const [shownRecoveryKey, setShownRecoveryKey] = useState<string | null>(null);
   const [exportModalOpen, setExportModalOpen] = useState(false);
+  const [twoStepMode, setTwoStepMode] = useState<"enable" | "disable" | null>(null);
+  const [changePasswordOpen, setChangePasswordOpen] = useState(false);
+
+  /** Work to resume after the authenticator step during sign-in / recovery. */
+  const pendingAfterMfaRef = useRef<(() => Promise<void>) | null>(null);
 
   // Toasts
   const [toasts, setToasts] = useState<ToastItem[]>([]);
@@ -156,7 +184,15 @@ export default function Home() {
     setRevealedIds(new Set());
     setShownRecoveryKey(null);
     setRecoveryModalOpen(false);
-    setPendingRevealAccount(null);
+    setPendingAction(null);
+    // Modals hold decrypted secrets in their own state; close them all.
+    setAccountModalOpen(false);
+    setEditingAccount(null);
+    setDeletingAccount(null);
+    setExportModalOpen(false);
+    setTwoStepMode(null);
+    setChangePasswordOpen(false);
+    pendingAfterMfaRef.current = null;
   }, []);
 
   // Idle auto-lock timer
@@ -207,10 +243,19 @@ export default function Home() {
 
   /** Load everything for a freshly unlocked vault, then open the UI. */
   const enterVault = async (unlocked: UnlockedVault, method: UnlockMethod) => {
-    const [loadedAccounts, loadedSettings] = await Promise.all([
+    const [loadedAccounts, loadedSettings, totpOn] = await Promise.all([
       loadAccounts(unlocked.vaultKey),
       loadSettings(unlocked.userId),
+      isTotpEnabled(),
     ]);
+
+    // two_step_login mirrors the real Supabase MFA state, never the reverse.
+    if (loadedSettings.twoStepLogin !== totpOn) {
+      loadedSettings.twoStepLogin = totpOn;
+      updateSetting(unlocked.userId, "twoStepLogin", totpOn).catch((err) =>
+        console.warn(errorMessage(err))
+      );
+    }
 
     try {
       await registerCurrentDevice(unlocked.sessionId);
@@ -259,9 +304,31 @@ export default function Home() {
     }
   };
 
+  /** Runs `next` now, or parks it until the authenticator code is verified. */
+  const continueAfterMfa = async (
+    mfaRequired: boolean,
+    next: () => Promise<void>
+  ): Promise<"done" | "mfa"> => {
+    if (mfaRequired) {
+      pendingAfterMfaRef.current = next;
+      return "mfa";
+    }
+    await next();
+    return "done";
+  };
+
   const handleLogin = async (userEmail: string, masterPassword: string) => {
-    const unlocked = await unlockWithPassword(userEmail, masterPassword);
-    await enterVault(unlocked, "password");
+    const { mfaRequired } = await signInForVault(userEmail, masterPassword);
+    return continueAfterMfa(mfaRequired, async () =>
+      enterVault(await openVault(masterPassword), "password")
+    );
+  };
+
+  const handleVerifyMfa = async (code: string) => {
+    await verifyTotp(code);
+    const next = pendingAfterMfaRef.current;
+    pendingAfterMfaRef.current = null;
+    await next?.();
   };
 
   const handleRegister = async (userEmail: string, masterPassword: string) => {
@@ -277,8 +344,13 @@ export default function Home() {
     recoveryKey: string,
     newMasterPassword: string
   ) => {
-    const unlocked = await recoverWithKey(userEmail, code, recoveryKey, newMasterPassword);
-    await enterVault(unlocked, "recovery");
+    const { mfaRequired } = await verifyRecoveryCode(userEmail, code);
+    return continueAfterMfa(mfaRequired, async () =>
+      enterVault(
+        await completeRecovery(userEmail, recoveryKey, newMasterPassword),
+        "recovery"
+      )
+    );
   };
 
   const handleLockNow = () => {
@@ -310,16 +382,50 @@ export default function Home() {
       return;
     }
 
-    const fiveMinsAgo = Date.now() - 5 * 60 * 1000;
-    if (settings.reenterToReveal && lastVerifiedAt < fiveMinsAgo) {
-      setPendingRevealAccount(acc);
-      return;
-    }
-
-    revealAccountPassword(acc);
+    void requireMasterPassword({ kind: "reveal", account: acc });
   };
 
-  const handleCopyPassword = async (acc: GameAccount) => {
+  const openEditAccount = (acc: GameAccount) => {
+    setEditingAccount(acc);
+    setAccountModalOpen(true);
+  };
+
+  const performGuarded = async (action: GuardedAction) => {
+    switch (action.kind) {
+      case "reveal":
+        revealAccountPassword(action.account);
+        return;
+      case "copy":
+        await copyPassword(action.account);
+        return;
+      case "edit":
+        openEditAccount(action.account);
+        return;
+      case "rotate":
+        await handleRotateRecoveryKey();
+        return;
+    }
+  };
+
+  /**
+   * Runs the action now if the master password was verified recently,
+   * otherwise asks for it first. Viewing/copying/editing a password honours
+   * the "re-enter to reveal" setting; rotating the recovery key always asks.
+   */
+  const requireMasterPassword = async (action: GuardedAction) => {
+    const gated = action.kind === "rotate" || settings.reenterToReveal;
+    if (gated && reauthExpired(lastVerifiedAt)) {
+      setPendingAction(action);
+      return;
+    }
+    await performGuarded(action);
+  };
+
+  const handleCopyPassword = (acc: GameAccount) => {
+    void requireMasterPassword({ kind: "copy", account: acc });
+  };
+
+  const copyPassword = async (acc: GameAccount) => {
     try {
       await navigator.clipboard.writeText(acc.password);
     } catch {
@@ -357,6 +463,11 @@ export default function Home() {
       vault.vaultKey,
       { ...data, monogram: generateMonogram(data.game) },
       editId
+        ? {
+            id: editId,
+            previousPassword: accounts.find((a) => a.id === editId)?.password,
+          }
+        : undefined
     );
 
     setNow(Date.now());
@@ -397,6 +508,10 @@ export default function Home() {
     value: SecuritySettings[K]
   ) => {
     if (!vault) return;
+    if (key === "twoStepLogin") {
+      setTwoStepMode(value ? "enable" : "disable");
+      return;
+    }
     const previous = settings[key];
     setSettings((prev) => ({ ...prev, [key]: value }));
     try {
@@ -445,6 +560,45 @@ export default function Home() {
       return;
     }
     await reloadDevicesAndLogs();
+  };
+
+  const setTwoStepMirror = (enabled: boolean) => {
+    if (!vault) return;
+    setSettings((prev) => ({ ...prev, twoStepLogin: enabled }));
+    updateSetting(vault.userId, "twoStepLogin", enabled).catch((err) =>
+      console.warn(errorMessage(err))
+    );
+  };
+
+  const handleConfirmTwoStep = async (factorId: string, code: string) => {
+    await confirmTotpEnrollment(factorId, code);
+    setTwoStepMirror(true);
+    addToast(
+      "Two-step login is on",
+      "success",
+      "Other signed-in devices will need a code to open the vault."
+    );
+    void appendLog("security", "Two-step login enabled", "Authenticator app");
+  };
+
+  const handleDisableTwoStep = async (code: string) => {
+    await disableTotp(code);
+    setTwoStepMirror(false);
+    addToast("Two-step login is off", "info");
+    void appendLog("security", "Two-step login disabled", "Authenticator app");
+  };
+
+  const handleChangeMasterPassword = async (
+    current: string,
+    next: string,
+    nonce?: string
+  ) => {
+    if (!vault) throw new Error("Vault is locked.");
+    const keys = await changeMasterPassword(vault, current, next, nonce);
+    setVault({ ...vault, keys });
+    setLastVerifiedAt(Date.now());
+    addToast("Master password changed", "success", "Use it next time you unlock.");
+    void refreshLogs(); // "Master password changed" is trigger-logged
   };
 
   const handleRotateRecoveryKey = async () => {
@@ -524,6 +678,10 @@ export default function Home() {
           onRegister={handleRegister}
           onSendRecoveryCode={sendRecoveryCode}
           onRecover={handleRecover}
+          onVerifyMfa={handleVerifyMfa}
+          onCancelMfa={() => {
+            pendingAfterMfaRef.current = null;
+          }}
           onToast={addToast}
         />
       ) : (
@@ -554,10 +712,9 @@ export default function Home() {
                   setEditingAccount(null);
                   setAccountModalOpen(true);
                 }}
-                onEditAccount={(acc) => {
-                  setEditingAccount(acc);
-                  setAccountModalOpen(true);
-                }}
+                onEditAccount={(acc) =>
+                  void requireMasterPassword({ kind: "edit", account: acc })
+                }
                 onDeleteAccount={(acc) => setDeletingAccount(acc)}
                 onGoToSecurity={() => setActiveTab("security")}
                 clearClipboardEnabled={settings.clearClipboard}
@@ -571,14 +728,17 @@ export default function Home() {
                 settings={settings}
                 devices={devices}
                 recentLogs={auditLogs}
-                onFixAccount={(acc) => {
-                  setEditingAccount(acc);
-                  setAccountModalOpen(true);
-                }}
+                onFixAccount={(acc) =>
+                  void requireMasterPassword({ kind: "edit", account: acc })
+                }
                 onUpdateSetting={handleUpdateSetting}
                 onSignOutDevice={handleSignOutDevice}
                 onSignOutOthers={handleSignOutOthers}
                 onOpenRecoveryKey={() => setRecoveryModalOpen(true)}
+                onOpenChangePassword={() => setChangePasswordOpen(true)}
+                recoveryKeyRotatedAt={
+                  vault ? Date.parse(vault.keys.recovery_key_rotated_at) : null
+                }
                 onOpenExportBackup={() => setExportModalOpen(true)}
                 onViewAllActivity={() => setActiveTab("activity")}
               />
@@ -594,7 +754,9 @@ export default function Home() {
         </div>
       )}
 
-      {/* Modals */}
+      {/* Modals — only while unlocked, so nothing decrypted outlives a lock */}
+      {isUnlocked && (
+      <>
       <AccountModal
         open={accountModalOpen}
         onClose={() => {
@@ -617,22 +779,6 @@ export default function Home() {
         onConfirm={handleDeleteAccount}
       />
 
-      <ReauthModal
-        open={Boolean(pendingRevealAccount)}
-        onClose={() => setPendingRevealAccount(null)}
-        onVerify={(pw) => (vault ? verifyMasterPassword(vault.keys, pw) : Promise.resolve(false))}
-        onVerified={() => {
-          setLastVerifiedAt(Date.now());
-          if (pendingRevealAccount) {
-            revealAccountPassword(pendingRevealAccount);
-          }
-          addToast("Master password verified", "success", "Unlocked reveals for 5 minutes.");
-        }}
-        onInvalidAttempt={() => {
-          addToast("Incorrect master password", "error");
-        }}
-      />
-
       <RecoveryKeyModal
         open={recoveryModalOpen}
         onClose={() => {
@@ -649,7 +795,25 @@ export default function Home() {
           }
           addToast("Recovery key copied", "success");
         }}
-        onRegenerate={handleRotateRecoveryKey}
+        onRegenerate={() => requireMasterPassword({ kind: "rotate" })}
+      />
+
+      <TwoStepModal
+        mode={twoStepMode}
+        onClose={() => setTwoStepMode(null)}
+        onStartSetup={startTotpEnrollment}
+        onConfirmSetup={handleConfirmTwoStep}
+        onCancelSetup={(factorId) => {
+          cancelTotpEnrollment(factorId).catch((err) => console.warn(errorMessage(err)));
+        }}
+        onDisable={handleDisableTwoStep}
+      />
+
+      <ChangeMasterPasswordModal
+        open={changePasswordOpen}
+        onClose={() => setChangePasswordOpen(false)}
+        onSubmit={handleChangeMasterPassword}
+        onRequestCode={requestReauthentication}
       />
 
       <ExportBackupModal
@@ -658,6 +822,25 @@ export default function Home() {
         accountCount={accounts.length}
         onConfirmExport={handleExportBackup}
       />
+
+      {/* Rendered last so it stacks above the modal that triggered it */}
+      <ReauthModal
+        open={pendingAction !== null}
+        onClose={() => setPendingAction(null)}
+        onVerify={(pw) => (vault ? verifyMasterPassword(vault.keys, pw) : Promise.resolve(false))}
+        onVerified={() => {
+          const action = pendingAction;
+          setPendingAction(null);
+          setLastVerifiedAt(Date.now());
+          addToast("Master password verified", "success", "No need to re-enter it for 5 minutes.");
+          if (action) void performGuarded(action);
+        }}
+        onInvalidAttempt={() => {
+          addToast("Incorrect master password", "error");
+        }}
+      />
+      </>
+      )}
 
       {/* Bottom Toast Notifications */}
       <ToastContainer

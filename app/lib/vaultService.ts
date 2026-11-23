@@ -37,6 +37,7 @@ export interface VaultKeysRow {
   wrapped_vault_key: string;
   recovery_wrapped_vault_key: string;
   key_version: number;
+  recovery_key_rotated_at: string;
 }
 
 interface GameAccountRow {
@@ -79,7 +80,7 @@ interface AuditLogRow {
 }
 
 const VAULT_KEY_COLUMNS =
-  "user_id, kdf, kdf_iterations, kdf_salt, wrapped_vault_key, recovery_wrapped_vault_key, key_version";
+  "user_id, kdf, kdf_iterations, kdf_salt, wrapped_vault_key, recovery_wrapped_vault_key, key_version, recovery_key_rotated_at";
 const ACCOUNT_COLUMNS =
   "id, game, monogram, nickname, login_encrypted, password_encrypted, notes_encrypted, two_factor, password_updated_at";
 const SETTINGS_COLUMNS =
@@ -89,9 +90,14 @@ const SETTINGS_COLUMNS =
 // Errors
 // -----------------------------------------------------------------------------
 
-/** `credentials` errors count toward the sign-in lockout; others don't. */
+/**
+ * - `credentials` / `mfa`: wrong secret — counts toward the sign-in lockout
+ * - `reauth`: Supabase wants an emailed nonce before changing the password
+ */
+export type VaultErrorKind = "credentials" | "mfa" | "reauth" | "other";
+
 export class VaultError extends Error {
-  constructor(message: string, readonly kind: "credentials" | "other" = "other") {
+  constructor(message: string, readonly kind: VaultErrorKind = "other") {
     super(message);
     this.name = "VaultError";
   }
@@ -108,7 +114,19 @@ function authError(error: AuthError): VaultError {
     case "email_not_confirmed":
       return new VaultError("Confirm your email first — check your inbox for the link.");
     case "otp_expired":
+    case "reauthentication_not_valid":
       return new VaultError("That code is invalid or has expired", "credentials");
+    case "mfa_verification_failed":
+    case "mfa_challenge_expired":
+      return new VaultError("Incorrect authenticator code", "mfa");
+    case "reauthentication_needed":
+    case "reauth_nonce_missing":
+      return new VaultError("Confirm it's you with the code we emailed you.", "reauth");
+    case "same_password":
+      return new VaultError("Choose a master password you haven't used before.");
+    case "mfa_totp_enroll_not_enabled":
+    case "mfa_totp_verify_not_enabled":
+      return new VaultError("Authenticator apps are disabled for this Supabase project.");
     case "over_request_rate_limit":
     case "over_email_send_rate_limit":
       return new VaultError("Too many attempts. Wait a moment and try again.");
@@ -189,7 +207,7 @@ async function createVault(masterPassword: string): Promise<{
 }
 
 /** Decrypt the vault for the signed-in user; creates it on first sign-in. */
-async function openVault(masterPassword: string): Promise<UnlockedVault> {
+export async function openVault(masterPassword: string): Promise<UnlockedVault> {
   const identity = await currentIdentity();
   const existing = await fetchVaultKeys();
 
@@ -212,16 +230,19 @@ async function openVault(masterPassword: string): Promise<UnlockedVault> {
   }
 }
 
-export async function unlockWithPassword(
+/**
+ * Step 1 of unlocking. Signs in with the derived auth password unless a
+ * session for this email already exists (vault locked but still signed in).
+ * Step 2 is `openVault()`, after `verifyTotp()` when `mfaRequired` is true.
+ */
+export async function signInForVault(
   email: string,
   masterPassword: string
-): Promise<UnlockedVault> {
+): Promise<{ mfaRequired: boolean }> {
   const supabase = getSupabase();
   const { data } = await supabase.auth.getSession();
   const sessionEmail = data.session?.user.email;
 
-  // Locked-but-signed-in: the master password is verified by unwrapping the
-  // vault key locally. Otherwise, sign in with the derived auth password.
   if (!sessionEmail || normalizeEmail(sessionEmail) !== normalizeEmail(email)) {
     const password = await deriveAuthPassword(email, masterPassword);
     const { error } = await supabase.auth.signInWithPassword({
@@ -231,7 +252,7 @@ export async function unlockWithPassword(
     if (error) throw authError(error);
   }
 
-  return openVault(masterPassword);
+  return { mfaRequired: await isMfaStepUpRequired() };
 }
 
 export type RegisterResult =
@@ -264,24 +285,33 @@ export async function sendRecoveryCode(email: string): Promise<void> {
 }
 
 /**
- * Forgotten master password: prove email ownership with a one-time code,
- * unwrap the vault with the recovery key, then set a new master password.
- * The used recovery key is rotated, and the new one is returned for display.
+ * Forgotten master password, step 1: prove email ownership with the emailed
+ * one-time code. Step 2 is `completeRecovery()` (after `verifyTotp()` when
+ * `mfaRequired` is true).
  */
-export async function recoverWithKey(
+export async function verifyRecoveryCode(
   email: string,
-  code: string,
-  recoveryKey: string,
-  newMasterPassword: string
-): Promise<UnlockedVault> {
-  const supabase = getSupabase();
-  const { error: otpError } = await supabase.auth.verifyOtp({
+  code: string
+): Promise<{ mfaRequired: boolean }> {
+  const { error } = await getSupabase().auth.verifyOtp({
     email: normalizeEmail(email),
     token: code.trim(),
     type: "email",
   });
-  if (otpError) throw authError(otpError);
+  if (error) throw authError(error);
+  return { mfaRequired: await isMfaStepUpRequired() };
+}
 
+/**
+ * Step 2: unwrap the vault with the recovery key, set a new master password
+ * and rotate the (now used) recovery key, which is returned for display.
+ */
+export async function completeRecovery(
+  email: string,
+  recoveryKey: string,
+  newMasterPassword: string
+): Promise<UnlockedVault> {
+  const supabase = getSupabase();
   const keys = await fetchVaultKeys();
   if (!keys) throw new VaultError("No vault exists for this account yet.");
 
@@ -297,14 +327,19 @@ export async function recoverWithKey(
     throw new VaultError("Invalid recovery key", "credentials");
   }
 
+  // Auth password first: if the re-wrap below then fails, the vault is still
+  // wrapped by the *old* recovery key, so recovery can simply be repeated.
+  const { error: pwError } = await supabase.auth.updateUser({
+    password: await deriveAuthPassword(email, newMasterPassword),
+  });
+  if (pwError) throw authError(pwError);
+
   const nextRecoveryKey = generateRecoveryKey();
   const [kek, nextRecoveryKek] = await Promise.all([
     deriveKek(newMasterPassword, keys.kdf_salt, keys.kdf_iterations),
     deriveKek(normalizeRecoveryKey(nextRecoveryKey), keys.kdf_salt, keys.kdf_iterations),
   ]);
 
-  // Re-wrap first: if the auth update below fails, the new recovery key still
-  // opens the vault, so the user is never locked out.
   const { data: updated, error } = await supabase
     .from("vault_keys")
     .update({
@@ -314,12 +349,11 @@ export async function recoverWithKey(
     .eq("user_id", keys.user_id)
     .select(VAULT_KEY_COLUMNS)
     .single<VaultKeysRow>();
-  if (error) throw dbError("Could not reset master password", error);
-
-  const { error: pwError } = await supabase.auth.updateUser({
-    password: await deriveAuthPassword(email, newMasterPassword),
-  });
-  if (pwError) throw authError(pwError);
+  if (error) {
+    throw new VaultError(
+      `Could not finish recovery (${error.message}). Your recovery key still works — try again.`
+    );
+  }
 
   return {
     ...(await currentIdentity()),
@@ -327,6 +361,140 @@ export async function recoverWithKey(
     keys: updated,
     newRecoveryKey: nextRecoveryKey,
   };
+}
+
+/**
+ * Change the master password while unlocked. Pass `nonce` after
+ * `requestReauthentication()` when this throws a `reauth` VaultError
+ * (only if "Secure password change" is enabled in Supabase Auth).
+ */
+export async function changeMasterPassword(
+  vault: Pick<UnlockedVault, "vaultKey" | "keys" | "email">,
+  currentPassword: string,
+  newPassword: string,
+  nonce?: string
+): Promise<VaultKeysRow> {
+  if (!(await verifyMasterPassword(vault.keys, currentPassword))) {
+    throw new VaultError("Current master password is incorrect", "credentials");
+  }
+  const supabase = getSupabase();
+  const [oldAuth, newAuth, kek] = await Promise.all([
+    deriveAuthPassword(vault.email, currentPassword),
+    deriveAuthPassword(vault.email, newPassword),
+    deriveKek(newPassword, vault.keys.kdf_salt, vault.keys.kdf_iterations),
+  ]);
+
+  const { error: pwError } = await supabase.auth.updateUser({
+    password: newAuth,
+    ...(nonce ? { nonce: nonce.trim() } : {}),
+  });
+  if (pwError) throw authError(pwError);
+
+  const { data, error } = await supabase
+    .from("vault_keys")
+    .update({ wrapped_vault_key: await wrapVaultKey(vault.vaultKey, kek) })
+    .eq("user_id", vault.keys.user_id)
+    .select(VAULT_KEY_COLUMNS)
+    .single<VaultKeysRow>();
+  if (error) {
+    // Keep login and vault in sync: put the old auth password back.
+    await supabase.auth.updateUser({ password: oldAuth });
+    throw dbError("Could not change master password", error);
+  }
+  return data;
+}
+
+/** Emails a one-time nonce for `changeMasterPassword(..., nonce)`. */
+export async function requestReauthentication(): Promise<void> {
+  const { error } = await getSupabase().auth.reauthenticate();
+  if (error) throw authError(error);
+}
+
+// -----------------------------------------------------------------------------
+// Two-step login (TOTP via Supabase Auth MFA)
+// The database requires an aal2 session for vault data once a factor exists.
+// -----------------------------------------------------------------------------
+
+async function isMfaStepUpRequired(): Promise<boolean> {
+  const { data, error } = await getSupabase().auth.mfa.getAuthenticatorAssuranceLevel();
+  if (error) throw authError(error);
+  return data.nextLevel === "aal2" && data.currentLevel !== "aal2";
+}
+
+async function verifiedTotpFactorId(): Promise<string | null> {
+  const { data, error } = await getSupabase().auth.mfa.listFactors();
+  if (error) throw authError(error);
+  return data.totp[0]?.id ?? null;
+}
+
+export async function isTotpEnabled(): Promise<boolean> {
+  return (await verifiedTotpFactorId()) !== null;
+}
+
+function cleanCode(code: string): string {
+  return code.replace(/\s/g, "");
+}
+
+/** Upgrades the current session to aal2. */
+export async function verifyTotp(code: string): Promise<void> {
+  const factorId = await verifiedTotpFactorId();
+  if (!factorId) throw new VaultError("Two-step login isn't set up for this account.");
+  const { error } = await getSupabase().auth.mfa.challengeAndVerify({
+    factorId,
+    code: cleanCode(code),
+  });
+  if (error) throw authError(error);
+}
+
+export interface TotpEnrollment {
+  factorId: string;
+  /** SVG data URL — render with <img>. */
+  qrCode: string;
+  /** Base32 secret for manual entry. */
+  secret: string;
+}
+
+export async function startTotpEnrollment(): Promise<TotpEnrollment> {
+  const mfa = getSupabase().auth.mfa;
+
+  // Clear abandoned (unverified) attempts so friendly names don't collide.
+  const { data: factors, error: listError } = await mfa.listFactors();
+  if (listError) throw authError(listError);
+  for (const f of factors.all) {
+    if (f.factor_type === "totp" && f.status === "unverified") {
+      await mfa.unenroll({ factorId: f.id });
+    }
+  }
+
+  const { data, error } = await mfa.enroll({
+    factorType: "totp",
+    issuer: "Conserve",
+    friendlyName: `Authenticator ${new Date().toISOString().slice(0, 19)}`,
+  });
+  if (error) throw authError(error);
+  return { factorId: data.id, qrCode: data.totp.qr_code, secret: data.totp.secret };
+}
+
+/** The first valid code activates the factor and upgrades this session to aal2. */
+export async function confirmTotpEnrollment(factorId: string, code: string): Promise<void> {
+  const { error } = await getSupabase().auth.mfa.challengeAndVerify({
+    factorId,
+    code: cleanCode(code),
+  });
+  if (error) throw authError(error);
+}
+
+export async function cancelTotpEnrollment(factorId: string): Promise<void> {
+  await getSupabase().auth.mfa.unenroll({ factorId });
+}
+
+/** Requires a current code, so an unattended unlocked tab can't silently remove 2FA. */
+export async function disableTotp(code: string): Promise<void> {
+  await verifyTotp(code);
+  const factorId = await verifiedTotpFactorId();
+  if (!factorId) return;
+  const { error } = await getSupabase().auth.mfa.unenroll({ factorId });
+  if (error) throw authError(error);
 }
 
 /** Re-authentication for "re-enter to reveal": purely local, no network. */
@@ -401,25 +569,37 @@ export async function loadAccounts(vaultKey: CryptoKey): Promise<GameAccount[]> 
 
 export type AccountInput = Omit<GameAccount, "id" | "updatedAt">;
 
+export interface AccountEdit {
+  id: string;
+  /** Plaintext password currently stored; used to detect a real change. */
+  previousPassword?: string;
+}
+
 export async function saveAccount(
   vaultKey: CryptoKey,
   input: AccountInput,
-  editId?: string
+  edit?: AccountEdit
 ): Promise<GameAccount> {
   const notes = input.notes?.trim();
-  const payload = {
+  const payload: Record<string, unknown> = {
     game: input.game.trim(),
     monogram: input.monogram,
     nickname: input.nickname.trim(),
     login_encrypted: await encryptString(vaultKey, input.login),
-    password_encrypted: await encryptString(vaultKey, input.password),
     notes_encrypted: notes ? await encryptString(vaultKey, notes) : null,
     two_factor: input.twoFactor,
   };
+  // AES-GCM uses a random IV, so re-encrypting an unchanged password still
+  // produces new ciphertext. The DB trigger treats any ciphertext change as a
+  // password change (resets password_updated_at, logs "Password changed"), so
+  // only send it when the plaintext actually changed.
+  if (!edit || edit.previousPassword !== input.password) {
+    payload.password_encrypted = await encryptString(vaultKey, input.password);
+  }
 
   const table = getSupabase().from("game_accounts");
-  const query = editId
-    ? table.update(payload).eq("id", editId)
+  const query = edit
+    ? table.update(payload).eq("id", edit.id)
     : table.insert(payload);
   const { data, error } = await query.select(ACCOUNT_COLUMNS).single<GameAccountRow>();
   if (error) throw dbError("Could not save account", error);

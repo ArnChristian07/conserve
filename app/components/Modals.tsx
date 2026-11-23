@@ -512,7 +512,7 @@ function ReauthModalContent({
       open={true}
       onClose={onClose}
       title="Confirm master password"
-      subtitle="Required once every 5 minutes before revealing a password."
+      subtitle="Required once every 5 minutes before viewing, copying or editing a password, and before rotating your recovery key."
     >
       <form onSubmit={handleSubmit} className="space-y-4">
         <div className="flex items-center gap-2.5 px-3 py-2.5 rounded-xl bg-[#F7F7F7] border border-[#EAEAEA] text-[12px] text-[#525252]">
@@ -738,6 +738,324 @@ export function ExportBackupModal({
           </button>
         </div>
       </div>
+    </ModalShell>
+  );
+}
+
+/* 6. Two-step login (authenticator app) Modal */
+export interface TotpSetup {
+  factorId: string;
+  qrCode: string;
+  secret: string;
+}
+
+interface TwoStepModalProps {
+  /** null = closed */
+  mode: "enable" | "disable" | null;
+  onClose: () => void;
+  /** enable: creates an unverified factor and returns its QR code */
+  onStartSetup: () => Promise<TotpSetup>;
+  onConfirmSetup: (factorId: string, code: string) => Promise<void>;
+  onCancelSetup: (factorId: string) => void;
+  onDisable: (code: string) => Promise<void>;
+}
+
+export function TwoStepModal(props: TwoStepModalProps) {
+  if (!props.mode) return null;
+  return <TwoStepModalContent key={props.mode} {...props} mode={props.mode} />;
+}
+
+function TwoStepModalContent({
+  mode,
+  onClose,
+  onStartSetup,
+  onConfirmSetup,
+  onCancelSetup,
+  onDisable,
+}: TwoStepModalProps & { mode: "enable" | "disable" }) {
+  const [setup, setSetup] = useState<TotpSetup | null>(null);
+  const [code, setCode] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [finished, setFinished] = useState(false);
+
+  useEffect(() => {
+    if (mode !== "enable") return;
+    let cancelled = false;
+    onStartSetup()
+      .then((s) => {
+        if (!cancelled) setSetup(s);
+      })
+      .catch((err) => {
+        if (!cancelled) setError(err instanceof Error ? err.message : "Could not start setup.");
+      });
+    return () => {
+      cancelled = true;
+    };
+    // Run once per open; the parent callbacks are stable for that lifetime.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handleClose = () => {
+    if (mode === "enable" && setup && !finished) onCancelSetup(setup.factorId);
+    onClose();
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (busy) return;
+    if (!/^\d{6}$/.test(code.replace(/\s/g, ""))) {
+      setError("Enter the 6-digit code from your authenticator app.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      if (mode === "enable") {
+        if (!setup) return;
+        await onConfirmSetup(setup.factorId, code);
+      } else {
+        await onDisable(code);
+      }
+      setFinished(true);
+      onClose();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Verification failed.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <ModalShell
+      open={true}
+      onClose={handleClose}
+      title={mode === "enable" ? "Turn on two-step login" : "Turn off two-step login"}
+      subtitle={
+        mode === "enable"
+          ? "Scan the QR code with an authenticator app (Google Authenticator, 1Password, Authy…)."
+          : "Enter a current code from your authenticator app to confirm."
+      }
+    >
+      <form onSubmit={handleSubmit} className="space-y-4">
+        {mode === "enable" && (
+          <div className="flex flex-col items-center gap-3">
+            <div className="w-44 h-44 rounded-xl border border-[#EAEAEA] bg-white flex items-center justify-center overflow-hidden">
+              {setup ? (
+                // Data-URL SVG from Supabase; next/image adds nothing here.
+                // eslint-disable-next-line @next/next/no-img-element
+                <img src={setup.qrCode} alt="Authenticator QR code" className="w-40 h-40" />
+              ) : (
+                <span className="text-[12px] text-[#A3A3A3]">{error ? "Unavailable" : "Generating…"}</span>
+              )}
+            </div>
+            {setup && (
+              <div className="w-full">
+                <p className="text-[11.5px] text-[#737373] mb-1">Can&apos;t scan? Enter this key:</p>
+                <code className="block w-full px-3 py-2 rounded-lg bg-[#F7F7F7] border border-[#EAEAEA] font-mono text-[12px] text-[#111111] break-all select-all">
+                  {setup.secret}
+                </code>
+              </div>
+            )}
+          </div>
+        )}
+
+        <div>
+          <label className="block text-[12px] font-medium text-[#404040] mb-1.5">
+            Authenticator code
+          </label>
+          <input
+            type="text"
+            inputMode="numeric"
+            autoComplete="one-time-code"
+            autoFocus={mode === "disable"}
+            value={code}
+            onChange={(e) => {
+              setCode(e.target.value);
+              setError("");
+            }}
+            placeholder="123456"
+            className="w-full h-10 px-3 rounded-xl border border-[#E2E2E2] font-mono tracking-widest text-[16px] sm:text-[14px] focus:outline-none focus:border-[#111111]"
+          />
+          {error && <p className="text-[12px] text-red-600 mt-1.5">{error}</p>}
+        </div>
+
+        {mode === "enable" && (
+          <p className="text-[11.5px] text-[#737373] leading-relaxed">
+            Once on, every sign-in needs a code. Losing the authenticator means losing
+            access to the vault, so keep a backup of the setup key somewhere safe.
+          </p>
+        )}
+
+        <div className="flex flex-col-reverse sm:flex-row sm:items-center sm:justify-end gap-2 sm:gap-2.5">
+          <button
+            type="button"
+            onClick={handleClose}
+            className="w-full sm:w-auto px-4 py-2.5 sm:py-2 rounded-xl border border-[#E2E2E2] text-[13px] font-medium text-[#404040] hover:bg-[#F5F5F5] cursor-pointer"
+          >
+            Cancel
+          </button>
+          <button
+            type="submit"
+            disabled={busy || (mode === "enable" && !setup)}
+            className="w-full sm:w-auto px-4 py-2.5 sm:py-2 rounded-xl bg-[#111111] text-white text-[13px] font-medium hover:bg-[#262626] active:scale-[0.98] transition-all cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
+          >
+            {busy ? "Verifying…" : mode === "enable" ? "Verify & turn on" : "Turn off"}
+          </button>
+        </div>
+      </form>
+    </ModalShell>
+  );
+}
+
+/* 7. Change Master Password Modal */
+interface ChangeMasterPasswordModalProps {
+  open: boolean;
+  onClose: () => void;
+  /** Throws a VaultError with kind "reauth" when Supabase wants an emailed code. */
+  onSubmit: (current: string, next: string, nonce?: string) => Promise<void>;
+  onRequestCode: () => Promise<void>;
+}
+
+export function ChangeMasterPasswordModal(props: ChangeMasterPasswordModalProps) {
+  if (!props.open) return null;
+  return <ChangeMasterPasswordContent {...props} />;
+}
+
+function ChangeMasterPasswordContent({
+  onClose,
+  onSubmit,
+  onRequestCode,
+}: ChangeMasterPasswordModalProps) {
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [nonce, setNonce] = useState("");
+  const [needsNonce, setNeedsNonce] = useState(false);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (busy) return;
+    if (!current) return setError("Enter your current master password.");
+    if (next.length < 8) return setError("Use at least 8 characters.");
+    if (next !== confirm) return setError("New master passwords do not match.");
+    if (next === current) return setError("Choose a different master password.");
+    if (needsNonce && !nonce.trim()) return setError("Enter the code we emailed you.");
+
+    setBusy(true);
+    setError("");
+    try {
+      await onSubmit(current, next, needsNonce ? nonce : undefined);
+      onClose();
+    } catch (err) {
+      const kind = (err as { kind?: string } | null)?.kind;
+      if (kind === "reauth" && !needsNonce) {
+        try {
+          await onRequestCode();
+          setNeedsNonce(true);
+          setError("For your security, enter the code we just emailed you.");
+        } catch (sendErr) {
+          setError(sendErr instanceof Error ? sendErr.message : "Could not send code.");
+        }
+      } else {
+        setError(err instanceof Error ? err.message : "Could not change master password.");
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const inputClass =
+    "w-full h-10 px-3 rounded-xl border border-[#E2E2E2] text-[16px] sm:text-[13.5px] focus:outline-none focus:border-[#111111]";
+
+  return (
+    <ModalShell
+      open={true}
+      onClose={onClose}
+      title="Change master password"
+      subtitle="Your vault is re-encrypted on this device. Your recovery key keeps working."
+    >
+      <form onSubmit={handleSubmit} className="space-y-3.5">
+        <div>
+          <label className="block text-[12px] font-medium text-[#404040] mb-1.5">
+            Current master password
+          </label>
+          <input
+            type="password"
+            autoFocus
+            autoComplete="current-password"
+            value={current}
+            onChange={(e) => setCurrent(e.target.value)}
+            className={inputClass}
+          />
+        </div>
+        <div>
+          <label className="block text-[12px] font-medium text-[#404040] mb-1.5">
+            New master password
+          </label>
+          <input
+            type="password"
+            autoComplete="new-password"
+            value={next}
+            onChange={(e) => setNext(e.target.value)}
+            placeholder="At least 8 characters"
+            className={inputClass}
+          />
+          {next && (
+            <p className="text-[11.5px] text-[#737373] mt-1">
+              Strength: {evaluatePasswordStrength(next).label}
+            </p>
+          )}
+        </div>
+        <div>
+          <label className="block text-[12px] font-medium text-[#404040] mb-1.5">
+            Confirm new master password
+          </label>
+          <input
+            type="password"
+            autoComplete="new-password"
+            value={confirm}
+            onChange={(e) => setConfirm(e.target.value)}
+            className={inputClass}
+          />
+        </div>
+        {needsNonce && (
+          <div>
+            <label className="block text-[12px] font-medium text-[#404040] mb-1.5">
+              Code from your email
+            </label>
+            <input
+              type="text"
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              value={nonce}
+              onChange={(e) => setNonce(e.target.value)}
+              className={`${inputClass} font-mono tracking-widest`}
+            />
+          </div>
+        )}
+
+        {error && <p className="text-[12px] text-red-600">{error}</p>}
+
+        <div className="flex flex-col-reverse sm:flex-row sm:items-center sm:justify-end gap-2 sm:gap-2.5 pt-1">
+          <button
+            type="button"
+            onClick={onClose}
+            className="w-full sm:w-auto px-4 py-2.5 sm:py-2 rounded-xl border border-[#E2E2E2] text-[13px] font-medium text-[#404040] hover:bg-[#F5F5F5] cursor-pointer"
+          >
+            Cancel
+          </button>
+          <button
+            type="submit"
+            disabled={busy}
+            className="w-full sm:w-auto px-4 py-2.5 sm:py-2 rounded-xl bg-[#111111] text-white text-[13px] font-medium hover:bg-[#262626] active:scale-[0.98] transition-all cursor-pointer disabled:opacity-60 disabled:cursor-wait"
+          >
+            {busy ? "Re-encrypting…" : "Change password"}
+          </button>
+        </div>
+      </form>
     </ModalShell>
   );
 }

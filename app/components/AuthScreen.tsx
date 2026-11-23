@@ -8,7 +8,8 @@ import { ToastVariant } from "../types/vault";
 
 interface AuthScreenProps {
   savedEmail: string;
-  onLogin: (email: string, masterPassword: string) => Promise<void>;
+  /** "mfa" → show the authenticator step, then call onVerifyMfa. */
+  onLogin: (email: string, masterPassword: string) => Promise<"done" | "mfa">;
   onRegister: (email: string, masterPassword: string) => Promise<"unlocked" | "confirm-email">;
   onSendRecoveryCode: (email: string) => Promise<void>;
   onRecover: (
@@ -16,7 +17,9 @@ interface AuthScreenProps {
     code: string,
     recoveryKey: string,
     newMasterPassword: string
-  ) => Promise<void>;
+  ) => Promise<"done" | "mfa">;
+  onVerifyMfa: (code: string) => Promise<void>;
+  onCancelMfa: () => void;
   onToast: (message: string, variant?: ToastVariant, detail?: string) => void;
 }
 
@@ -25,7 +28,7 @@ const MAX_ATTEMPTS = 5;
 const LOCKOUT_MS = 15 * 60 * 1000;
 
 function isCredentialError(err: unknown): boolean {
-  return err instanceof VaultError && err.kind === "credentials";
+  return err instanceof VaultError && (err.kind === "credentials" || err.kind === "mfa");
 }
 
 function errorMessage(err: unknown): string {
@@ -38,6 +41,8 @@ export function AuthScreen({
   onRegister,
   onSendRecoveryCode,
   onRecover,
+  onVerifyMfa,
+  onCancelMfa,
   onToast,
 }: AuthScreenProps) {
   const [mode, setMode] = useState<"login" | "register">("login");
@@ -50,6 +55,8 @@ export function AuthScreen({
   const [confirmPassword, setConfirmPassword] = useState("");
   const [recoveryInput, setRecoveryInput] = useState("");
   const [otpCode, setOtpCode] = useState("");
+  const [mfaStep, setMfaStep] = useState(false);
+  const [mfaCode, setMfaCode] = useState("");
   const [showPassword, setShowPassword] = useState(false);
 
   // UX-level throttle; the real limits are Supabase Auth's server-side rate limits.
@@ -91,7 +98,14 @@ export function AuthScreen({
     return true;
   };
 
+  const leaveMfaStep = () => {
+    setMfaStep(false);
+    setMfaCode("");
+    onCancelMfa();
+  };
+
   const switchMode = (next: "login" | "register") => {
+    if (mfaStep) leaveMfaStep();
     setMode(next);
     setUseRecovery(false);
     setCodeSent(false);
@@ -117,6 +131,31 @@ export function AuthScreen({
         "error",
         `Too many failed attempts. Try again in ${minsLeft} min.`
       );
+      return;
+    }
+
+    if (mfaStep) {
+      if (!/^\d{6}$/.test(mfaCode.replace(/\s/g, ""))) {
+        onToast("Enter the 6-digit code from your authenticator app", "error");
+        return;
+      }
+      setBusy(true);
+      try {
+        await onVerifyMfa(mfaCode);
+        setFailedAttempts(0);
+        setMfaStep(false);
+        setMfaCode("");
+      } catch (err) {
+        // A wrong code keeps the step open; anything after it (e.g. wrong
+        // master password) sends the user back to the main form.
+        if (!(err instanceof VaultError && err.kind === "mfa")) {
+          setMfaStep(false);
+          setMfaCode("");
+        }
+        recordFailure(err);
+      } finally {
+        setBusy(false);
+      }
       return;
     }
 
@@ -158,7 +197,11 @@ export function AuthScreen({
           onToast("Enter the code from your email", "error");
           return;
         }
-        await onRecover(trimmedEmail, otpCode, recoveryInput, password);
+        const recovered = await onRecover(trimmedEmail, otpCode, recoveryInput, password);
+        if (recovered === "mfa") {
+          setMfaStep(true);
+          return;
+        }
         setFailedAttempts(0);
         return;
       }
@@ -167,7 +210,11 @@ export function AuthScreen({
         onToast("Enter your master password", "error");
         return;
       }
-      await onLogin(trimmedEmail, password);
+      const result = await onLogin(trimmedEmail, password);
+      if (result === "mfa") {
+        setMfaStep(true);
+        return;
+      }
       setFailedAttempts(0);
     } catch (err) {
       recordFailure(err);
@@ -176,7 +223,11 @@ export function AuthScreen({
     }
   };
 
-  const submitLabel = busy
+  const submitLabel = mfaStep
+    ? busy
+      ? "Verifying…"
+      : "Verify code"
+    : busy
     ? mode === "register"
       ? "Creating vault…"
       : useRecovery && !codeSent
@@ -279,10 +330,12 @@ export function AuthScreen({
 
           <div className="mb-6">
             <h2 className="text-[24px] font-bold tracking-tight text-[#111111]">
-              {mode === "login" ? "Welcome back" : "Create your vault"}
+              {mfaStep ? "Two-step verification" : mode === "login" ? "Welcome back" : "Create your vault"}
             </h2>
             <p className="text-[13.5px] text-[#737373] mt-1">
-              {mode === "login"
+              {mfaStep
+                ? "Enter the 6-digit code from your authenticator app."
+                : mode === "login"
                 ? useRecovery
                   ? "Use your recovery key to set a new master password."
                   : "Unlock your vault with your master password."
@@ -291,6 +344,24 @@ export function AuthScreen({
           </div>
 
           <form onSubmit={handleSubmit} className="space-y-4">
+            {mfaStep ? (
+              <div>
+                <label className="block text-[12.5px] font-semibold text-[#111111] mb-1.5">
+                  Authenticator code
+                </label>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  autoFocus
+                  value={mfaCode}
+                  onChange={(e) => setMfaCode(e.target.value)}
+                  placeholder="123456"
+                  className="w-full h-11 px-3.5 rounded-xl border border-[#E2E2E2] bg-white font-mono tracking-widest text-[16px] sm:text-[14px] text-[#111111] placeholder:text-[#A3A3A3] focus:outline-none focus:border-[#111111] transition-colors"
+                />
+              </div>
+            ) : (
+            <>
             <div>
               <label className="block text-[12.5px] font-semibold text-[#111111] mb-1.5">
                 Email
@@ -405,6 +476,9 @@ export function AuthScreen({
               </div>
             )}
 
+            </>
+            )}
+
             <button
               type="submit"
               disabled={busy}
@@ -413,6 +487,16 @@ export function AuthScreen({
             >
               {submitLabel}
             </button>
+
+            {mfaStep && (
+              <button
+                type="button"
+                onClick={leaveMfaStep}
+                className="w-full text-[12.5px] text-[#525252] underline underline-offset-2 hover:text-[#111111] cursor-pointer py-1"
+              >
+                Back
+              </button>
+            )}
           </form>
 
           <div className="mt-5 flex items-center gap-2 text-[12px] text-[#888888]">
