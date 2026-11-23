@@ -1,13 +1,6 @@
 "use client";
 
-import React, {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  useSyncExternalStore,
-} from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ActivityLogView } from "./components/ActivityLogView";
 import { AuthScreen } from "./components/AuthScreen";
 import {
@@ -21,17 +14,29 @@ import { SecurityCenterView } from "./components/SecurityCenterView";
 import { Sidebar } from "./components/Sidebar";
 import { ToastContainer } from "./components/ToastContainer";
 import { VaultView } from "./components/VaultView";
+import { computeVaultHealth, generateMonogram } from "./lib/vaultUtils";
 import {
-  computeVaultHealth,
-  formatCurrentTimestampLabel,
-  generateMonogram,
-  generateRecoveryKey,
-  INITIAL_ACCOUNTS,
-  INITIAL_AUDIT_LOGS,
-  INITIAL_DEVICES,
-  INITIAL_RECOVERY_KEY,
-  INITIAL_SETTINGS,
-} from "./data/initialVault";
+  UnlockedVault,
+  buildEncryptedBackup,
+  deleteAccount,
+  getSessionEmail,
+  loadAccounts,
+  loadDevices,
+  loadLogs,
+  loadSettings,
+  logEvent,
+  recoverWithKey,
+  registerCurrentDevice,
+  registerVault,
+  revokeDevice,
+  revokeOtherDevices,
+  rotateRecoveryKey,
+  saveAccount,
+  sendRecoveryCode,
+  unlockWithPassword,
+  updateSetting,
+  verifyMasterPassword,
+} from "./lib/vaultService";
 import {
   AuditCategory,
   AuditLogEntry,
@@ -43,51 +48,47 @@ import {
   ToastVariant,
 } from "./types/vault";
 
-const STORAGE_KEY = "conserve_vault_state_v1";
-const emptySubscribe = () => () => {};
+/** Mirrors the column defaults of public.security_settings until loaded. */
+const DEFAULT_SETTINGS: SecuritySettings = {
+  reenterToReveal: true,
+  clearClipboard: true,
+  lockOnTabClose: true,
+  twoStepLogin: false,
+  emailNewSignIns: true,
+  autoLockMinutes: 15,
+};
 
-function readStoredState() {
-  if (typeof window === "undefined") return null;
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : null;
-  } catch {
-    return null;
-  }
+type UnlockMethod = "password" | "register" | "recovery";
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : "Something went wrong.";
+}
+
+function downloadFile(contents: string, type: string, filename: string) {
+  const url = URL.createObjectURL(new Blob([contents], { type }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 export default function Home() {
-  const hydrated = useSyncExternalStore(
-    emptySubscribe,
-    () => true,
-    () => false
-  );
-  const [isUnlocked, setIsUnlocked] = useState(false);
+  const [ready, setReady] = useState(false);
+  const [configError, setConfigError] = useState<string | null>(null);
+
+  // Decrypted vault lives in memory only; locking drops it.
+  const [vault, setVault] = useState<UnlockedVault | null>(null);
+  const isUnlocked = vault !== null;
+
   const [activeTab, setActiveTab] = useState<NavTab>("vault");
   const [selectedGame, setSelectedGame] = useState<string>("all");
+  const [email, setEmail] = useState("");
 
-  const [email, setEmail] = useState(
-    () => readStoredState()?.email ?? "you@example.com"
-  );
-  const [masterPassword, setMasterPassword] = useState(
-    () => readStoredState()?.masterPassword ?? "conserve2026"
-  );
-  const [recoveryKey, setRecoveryKey] = useState(
-    () => readStoredState()?.recoveryKey ?? INITIAL_RECOVERY_KEY
-  );
-
-  const [accounts, setAccounts] = useState<GameAccount[]>(
-    () => readStoredState()?.accounts ?? INITIAL_ACCOUNTS
-  );
-  const [settings, setSettings] = useState<SecuritySettings>(
-    () => readStoredState()?.settings ?? INITIAL_SETTINGS
-  );
-  const [devices, setDevices] = useState<SignedInDevice[]>(
-    () => readStoredState()?.devices ?? INITIAL_DEVICES
-  );
-  const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>(
-    () => readStoredState()?.auditLogs ?? INITIAL_AUDIT_LOGS
-  );
+  const [accounts, setAccounts] = useState<GameAccount[]>([]);
+  const [settings, setSettings] = useState<SecuritySettings>(DEFAULT_SETTINGS);
+  const [devices, setDevices] = useState<SignedInDevice[]>([]);
+  const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
 
   const [revealedIds, setRevealedIds] = useState<Set<string>>(new Set());
   const [lastVerifiedAt, setLastVerifiedAt] = useState<number>(0);
@@ -95,15 +96,12 @@ export default function Home() {
 
   // Modals
   const [accountModalOpen, setAccountModalOpen] = useState(false);
-  const [editingAccount, setEditingAccount] = useState<GameAccount | null>(
-    null
-  );
-  const [deletingAccount, setDeletingAccount] = useState<GameAccount | null>(
-    null
-  );
-  const [pendingRevealAccount, setPendingRevealAccount] =
-    useState<GameAccount | null>(null);
+  const [editingAccount, setEditingAccount] = useState<GameAccount | null>(null);
+  const [deletingAccount, setDeletingAccount] = useState<GameAccount | null>(null);
+  const [pendingRevealAccount, setPendingRevealAccount] = useState<GameAccount | null>(null);
   const [recoveryModalOpen, setRecoveryModalOpen] = useState(false);
+  /** Freshly generated recovery key — shown once, then discarded. */
+  const [shownRecoveryKey, setShownRecoveryKey] = useState<string | null>(null);
   const [exportModalOpen, setExportModalOpen] = useState(false);
 
   // Toasts
@@ -125,52 +123,41 @@ export default function Home() {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }, []);
 
+  const refreshLogs = useCallback(async () => {
+    try {
+      setAuditLogs(await loadLogs());
+    } catch (err) {
+      console.warn(errorMessage(err));
+    }
+  }, []);
+
+  /** Write a client-side audit event, then refresh the activity feed. */
   const appendLog = useCallback(
-    (action: string, category: AuditCategory, target?: string) => {
-      const entry: AuditLogEntry = {
-        id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        timestampLabel: formatCurrentTimestampLabel(),
-        createdAt: Date.now(),
-        action,
-        target,
-        device: "Chrome on Windows",
-        location: "Quezon City, PH",
-        category,
-      };
-      setAuditLogs((prev) => [entry, ...prev]);
+    async (category: Exclude<AuditCategory, "account">, action: string, target?: string) => {
+      await logEvent(category, action, target);
+      await refreshLogs();
     },
-    []
+    [refreshLogs]
   );
 
-  // Persist to localStorage
+  // Restore the persisted Supabase session's email (the vault itself stays locked).
   useEffect(() => {
-    if (!hydrated) return;
-    try {
-      localStorage.setItem(
-        STORAGE_KEY,
-        JSON.stringify({
-          accounts,
-          settings,
-          devices,
-          auditLogs,
-          email,
-          masterPassword,
-          recoveryKey,
-        })
-      );
-    } catch {
-      // ignore storage errors
-    }
-  }, [
-    hydrated,
-    accounts,
-    settings,
-    devices,
-    auditLogs,
-    email,
-    masterPassword,
-    recoveryKey,
-  ]);
+    getSessionEmail()
+      .then((sessionEmail) => setEmail(sessionEmail ?? ""))
+      .catch((err) => setConfigError(errorMessage(err)))
+      .finally(() => setReady(true));
+  }, []);
+
+  const lockVault = useCallback(() => {
+    setVault(null);
+    setAccounts([]);
+    setDevices([]);
+    setAuditLogs([]);
+    setRevealedIds(new Set());
+    setShownRecoveryKey(null);
+    setRecoveryModalOpen(false);
+    setPendingRevealAccount(null);
+  }, []);
 
   // Idle auto-lock timer
   useEffect(() => {
@@ -179,9 +166,8 @@ export default function Home() {
     const resetTimer = () => {
       clearTimeout(timer);
       timer = setTimeout(() => {
-        setIsUnlocked(false);
-        setRevealedIds(new Set());
-        appendLog("Vault auto-locked", "security", "Idle timeout");
+        void logEvent("security", "Vault auto-locked", "Idle timeout");
+        lockVault();
         addToast(
           "Vault auto-locked",
           "info",
@@ -198,7 +184,7 @@ export default function Home() {
       clearTimeout(timer);
       events.forEach((ev) => window.removeEventListener(ev, resetTimer));
     };
-  }, [isUnlocked, settings.autoLockMinutes, appendLog, addToast]);
+  }, [isUnlocked, settings.autoLockMinutes, lockVault, addToast]);
 
   // Derived data
   const health = useMemo(() => computeVaultHealth(accounts, now), [accounts, now]);
@@ -213,54 +199,97 @@ export default function Home() {
       .sort((a, b) => a.game.localeCompare(b.game));
   }, [accounts]);
 
-  const existingGames = useMemo(
-    () => gameCounts.map((g) => g.game),
-    [gameCounts]
-  );
+  const existingGames = useMemo(() => gameCounts.map((g) => g.game), [gameCounts]);
 
-  // Handlers
-  const handleUnlock = (
-    userEmail: string,
-    method: "password" | "recovery"
-  ) => {
+  // ---------------------------------------------------------------------------
+  // Unlock / register / recover
+  // ---------------------------------------------------------------------------
+
+  /** Load everything for a freshly unlocked vault, then open the UI. */
+  const enterVault = async (unlocked: UnlockedVault, method: UnlockMethod) => {
+    const [loadedAccounts, loadedSettings] = await Promise.all([
+      loadAccounts(unlocked.vaultKey),
+      loadSettings(unlocked.userId),
+    ]);
+
+    try {
+      await registerCurrentDevice(unlocked.sessionId);
+    } catch (err) {
+      console.warn(errorMessage(err));
+    }
+
+    const vaultCreated = unlocked.newRecoveryKey !== null && method !== "recovery";
+    if (!vaultCreated) {
+      // "Vault created" is logged by a database trigger.
+      await logEvent(
+        "security",
+        "Vault unlocked",
+        method === "recovery" ? "Recovery key used" : "Master password verified"
+      );
+    }
+
+    const [loadedDevices, loadedLogs] = await Promise.all([
+      loadDevices(unlocked.sessionId),
+      loadLogs(),
+    ]);
+
     const ts = Date.now();
-    setEmail(userEmail);
-    setIsUnlocked(true);
+    setAccounts(loadedAccounts);
+    setSettings(loadedSettings);
+    setDevices(loadedDevices);
+    setAuditLogs(loadedLogs);
+    setEmail(unlocked.email);
     setLastVerifiedAt(ts);
     setNow(ts);
     setActiveTab("vault");
-    appendLog(
-      "Vault unlocked",
-      "security",
-      method === "recovery" ? "Recovery key used" : "Master password verified"
-    );
-    addToast(
-      "Vault unlocked",
-      "success",
-      method === "recovery"
-        ? "Unlocked using your recovery key."
-        : "AES-256 session active on this device."
-    );
+    setSelectedGame("all");
+    setVault(unlocked);
+
+    if (unlocked.newRecoveryKey) {
+      setShownRecoveryKey(unlocked.newRecoveryKey);
+      setRecoveryModalOpen(true);
+    }
+
+    if (method === "recovery") {
+      addToast("Master password reset", "success", "Save your new recovery key now.");
+    } else if (vaultCreated) {
+      addToast("Vault created & unlocked", "success", "Save your recovery key now.");
+    } else {
+      addToast("Vault unlocked", "success", "AES-256 session active on this device.");
+    }
   };
 
-  const handleRegister = (userEmail: string, newPassword: string) => {
-    const ts = Date.now();
-    setEmail(userEmail);
-    setMasterPassword(newPassword);
-    setIsUnlocked(true);
-    setLastVerifiedAt(ts);
-    setNow(ts);
-    setActiveTab("vault");
-    appendLog("Vault created", "security", userEmail);
-    addToast("Vault created & unlocked", "success", `Signed in as ${userEmail}`);
+  const handleLogin = async (userEmail: string, masterPassword: string) => {
+    const unlocked = await unlockWithPassword(userEmail, masterPassword);
+    await enterVault(unlocked, "password");
+  };
+
+  const handleRegister = async (userEmail: string, masterPassword: string) => {
+    const result = await registerVault(userEmail, masterPassword);
+    if (result.status === "confirm-email") return "confirm-email" as const;
+    await enterVault(result.vault, "register");
+    return "unlocked" as const;
+  };
+
+  const handleRecover = async (
+    userEmail: string,
+    code: string,
+    recoveryKey: string,
+    newMasterPassword: string
+  ) => {
+    const unlocked = await recoverWithKey(userEmail, code, recoveryKey, newMasterPassword);
+    await enterVault(unlocked, "recovery");
   };
 
   const handleLockNow = () => {
-    setIsUnlocked(false);
-    setRevealedIds(new Set());
-    appendLog("Vault locked", "security", "Manual lock");
-    addToast("Vault locked", "info", "All credentials re-encrypted.");
+    void logEvent("security", "Vault locked", "Manual lock");
+    lockVault();
+    addToast("Vault locked", "info", "Decrypted data cleared from memory.");
   };
+
+  // ---------------------------------------------------------------------------
+  // Vault items
+  // ---------------------------------------------------------------------------
 
   const revealAccountPassword = (acc: GameAccount) => {
     setRevealedIds((prev) => {
@@ -268,7 +297,7 @@ export default function Home() {
       next.add(acc.id);
       return next;
     });
-    appendLog("Password revealed", "access", `${acc.game} — ${acc.nickname}`);
+    void appendLog("access", "Password revealed", `${acc.game} — ${acc.nickname}`);
   };
 
   const handleToggleReveal = (acc: GameAccount) => {
@@ -294,9 +323,9 @@ export default function Home() {
     try {
       await navigator.clipboard.writeText(acc.password);
     } catch {
-      // Fallback if clipboard API blocked
+      // Clipboard API blocked
     }
-    appendLog("Password copied", "access", `${acc.game} — ${acc.nickname}`);
+    void appendLog("access", "Password copied", `${acc.game} — ${acc.nickname}`);
 
     if (settings.clearClipboard) {
       if (clipboardTimerRef.current) clearTimeout(clipboardTimerRef.current);
@@ -318,138 +347,183 @@ export default function Home() {
     }
   };
 
-  const handleSaveAccount = (
+  /** Throws on failure so the modal can show the error and stay open. */
+  const handleSaveAccount = async (
     data: Omit<GameAccount, "id" | "updatedAt" | "monogram">,
     editId?: string
   ) => {
-    const ts = Date.now();
-    setNow(ts);
-    const monogram = generateMonogram(data.game);
+    if (!vault) throw new Error("Vault is locked.");
+    const saved = await saveAccount(
+      vault.vaultKey,
+      { ...data, monogram: generateMonogram(data.game) },
+      editId
+    );
+
+    setNow(Date.now());
     if (editId) {
-      setAccounts((prev) =>
-        prev.map((a) =>
-          a.id === editId
-            ? { ...a, ...data, monogram, updatedAt: ts }
-            : a
-        )
-      );
-      appendLog("Account edited", "account", `${data.game} — ${data.nickname}`);
-      addToast(
-        "Account updated",
-        "success",
-        `${data.game} — ${data.nickname}`
-      );
+      setAccounts((prev) => prev.map((a) => (a.id === editId ? saved : a)));
+      addToast("Account updated", "success", `${saved.game} — ${saved.nickname}`);
     } else {
-      const newAcc: GameAccount = {
-        id: `acc-${ts}`,
-        ...data,
-        monogram,
-        updatedAt: ts,
-      };
-      setAccounts((prev) => [newAcc, ...prev]);
-      appendLog("Account added", "account", `${data.game} — ${data.nickname}`);
-      addToast(
-        "Account added to vault",
-        "success",
-        `${data.game} — ${data.nickname}`
-      );
+      setAccounts((prev) => [saved, ...prev]);
+      addToast("Account added to vault", "success", `${saved.game} — ${saved.nickname}`);
     }
+    // Account events are written by a database trigger.
+    void refreshLogs();
   };
 
-  const handleDeleteAccount = (acc: GameAccount) => {
+  const handleDeleteAccount = async (acc: GameAccount) => {
+    try {
+      await deleteAccount(acc.id);
+    } catch (err) {
+      addToast("Could not delete account", "error", errorMessage(err));
+      return;
+    }
     setAccounts((prev) => prev.filter((a) => a.id !== acc.id));
     setRevealedIds((prev) => {
       const next = new Set(prev);
       next.delete(acc.id);
       return next;
     });
-    appendLog("Account removed", "account", `${acc.game} — ${acc.nickname}`);
     addToast("Account deleted", "info", `${acc.game} — ${acc.nickname}`);
+    void refreshLogs();
   };
 
-  const handleUpdateSetting = <K extends keyof SecuritySettings>(
+  // ---------------------------------------------------------------------------
+  // Security center
+  // ---------------------------------------------------------------------------
+
+  const handleUpdateSetting = async <K extends keyof SecuritySettings>(
     key: K,
     value: SecuritySettings[K]
   ) => {
+    if (!vault) return;
+    const previous = settings[key];
     setSettings((prev) => ({ ...prev, [key]: value }));
-    appendLog("Security setting updated", "security", `${String(key)}: ${String(value)}`);
+    try {
+      await updateSetting(vault.userId, key, value);
+    } catch (err) {
+      setSettings((prev) => ({ ...prev, [key]: previous }));
+      addToast("Could not update setting", "error", errorMessage(err));
+      return;
+    }
     addToast("Vault setting updated", "success");
+    void appendLog("security", "Security setting updated", `${String(key)}: ${String(value)}`);
   };
 
-  const handleSignOutDevice = (deviceId: string) => {
+  const reloadDevicesAndLogs = async () => {
+    if (!vault) return;
+    try {
+      setDevices(await loadDevices(vault.sessionId));
+    } catch (err) {
+      console.warn(errorMessage(err));
+    }
+    await refreshLogs();
+  };
+
+  const handleSignOutDevice = async (deviceId: string) => {
     const target = devices.find((d) => d.id === deviceId);
-    setDevices((prev) => prev.filter((d) => d.id !== deviceId));
-    if (target) {
-      appendLog("Device signed out", "device", target.name);
-      addToast("Device signed out", "info", target.name);
+    try {
+      await revokeDevice(deviceId);
+    } catch (err) {
+      addToast("Could not sign out device", "error", errorMessage(err));
+      return;
+    }
+    addToast("Device signed out", "info", target?.name);
+    await reloadDevicesAndLogs();
+  };
+
+  const handleSignOutOthers = async () => {
+    try {
+      const removedCount = await revokeOtherDevices();
+      addToast(
+        "Signed out all other devices",
+        "success",
+        `${removedCount} session(s) revoked.`
+      );
+    } catch (err) {
+      addToast("Could not sign out other devices", "error", errorMessage(err));
+      return;
+    }
+    await reloadDevicesAndLogs();
+  };
+
+  const handleRotateRecoveryKey = async () => {
+    if (!vault) return;
+    try {
+      const { recoveryKey, keys } = await rotateRecoveryKey(vault);
+      setVault({ ...vault, keys });
+      setShownRecoveryKey(recoveryKey);
+      addToast("New recovery key generated", "success", "Save it offline.");
+      void refreshLogs(); // "Recovery key regenerated" is trigger-logged
+    } catch (err) {
+      addToast("Could not rotate recovery key", "error", errorMessage(err));
     }
   };
 
-  const handleSignOutOthers = () => {
-    const removedCount = devices.filter((d) => !d.isCurrent).length;
-    setDevices((prev) => prev.filter((d) => d.isCurrent));
-    appendLog("Signed out other devices", "device", `${removedCount} sessions ended`);
-    addToast(
-      "Signed out all other devices",
-      "success",
-      `${removedCount} session(s) revoked.`
-    );
-  };
-
-  const handleExportBackup = () => {
-    const payload = {
-      version: "1.0",
-      exportedAt: new Date().toISOString(),
-      cipher: "AES-256-GCM",
-      email,
-      accountsCount: accounts.length,
-      accounts,
-    };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], {
-      type: "application/json",
-    });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `conserve-backup-${new Date().toISOString().slice(0, 10)}.conserve.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-    appendLog("Encrypted backup exported", "security", `${accounts.length} accounts`);
-    addToast("Encrypted backup downloaded", "success", `${accounts.length} accounts included.`);
+  const handleExportBackup = async () => {
+    try {
+      const { json, count } = await buildEncryptedBackup(email);
+      downloadFile(
+        json,
+        "application/json",
+        `conserve-backup-${new Date().toISOString().slice(0, 10)}.conserve.json`
+      );
+      addToast("Encrypted backup downloaded", "success", `${count} accounts included.`);
+      void appendLog("security", "Encrypted backup exported", `${count} accounts`);
+    } catch (err) {
+      addToast("Backup failed", "error", errorMessage(err));
+    }
   };
 
   const handleExportLogsCsv = () => {
     const header = "Timestamp,Category,Action,Target,Device,Location\n";
     const rows = auditLogs
       .map((l) =>
-        [l.timestampLabel, l.category, l.action, l.target ?? "", l.device, l.location ?? ""]
-          .map((v) => `"${String(v).replace(/"/g, '""')}"`)
+        [
+          new Date(l.createdAt).toISOString(),
+          l.category,
+          l.action,
+          l.target ?? "",
+          l.device,
+          l.location ?? "",
+        ]
+          // Quote, and neutralise spreadsheet formula injection (=, +, -, @).
+          .map((v) => `"${String(v).replace(/^([=+\-@])/, "'$1").replace(/"/g, '""')}"`)
           .join(",")
       )
       .join("\n");
-    const blob = new Blob([header + rows], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `conserve-audit-log-${new Date().toISOString().slice(0, 10)}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
+    downloadFile(
+      header + rows,
+      "text/csv;charset=utf-8",
+      `conserve-audit-log-${new Date().toISOString().slice(0, 10)}.csv`
+    );
     addToast("Audit log exported as CSV", "success");
   };
 
-  if (!hydrated) {
+  if (!ready) {
     return <div className="min-h-screen bg-[#0D0D0D]" />;
+  }
+
+  if (configError) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[#0D0D0D] px-4">
+        <div className="max-w-md rounded-2xl border border-white/10 bg-white/[0.04] p-6 text-white">
+          <h1 className="text-[17px] font-semibold">Conserve can&apos;t connect</h1>
+          <p className="mt-2 text-[13.5px] leading-relaxed text-[#9A9A9A]">{configError}</p>
+        </div>
+      </div>
+    );
   }
 
   return (
     <>
       {!isUnlocked ? (
         <AuthScreen
-          expectedPassword={masterPassword}
-          expectedRecoveryKey={recoveryKey}
           savedEmail={email}
-          onUnlock={handleUnlock}
+          onLogin={handleLogin}
           onRegister={handleRegister}
+          onSendRecoveryCode={sendRecoveryCode}
+          onRecover={handleRecover}
           onToast={addToast}
         />
       ) : (
@@ -546,7 +620,7 @@ export default function Home() {
       <ReauthModal
         open={Boolean(pendingRevealAccount)}
         onClose={() => setPendingRevealAccount(null)}
-        expectedPassword={masterPassword}
+        onVerify={(pw) => (vault ? verifyMasterPassword(vault.keys, pw) : Promise.resolve(false))}
         onVerified={() => {
           setLastVerifiedAt(Date.now());
           if (pendingRevealAccount) {
@@ -561,22 +635,21 @@ export default function Home() {
 
       <RecoveryKeyModal
         open={recoveryModalOpen}
-        onClose={() => setRecoveryModalOpen(false)}
-        recoveryKey={recoveryKey}
+        onClose={() => {
+          setRecoveryModalOpen(false);
+          setShownRecoveryKey(null); // never keep the plaintext key around
+        }}
+        recoveryKey={shownRecoveryKey}
         onCopy={async () => {
+          if (!shownRecoveryKey) return;
           try {
-            await navigator.clipboard.writeText(recoveryKey);
+            await navigator.clipboard.writeText(shownRecoveryKey);
           } catch {
             // ignore
           }
           addToast("Recovery key copied", "success");
         }}
-        onRegenerate={() => {
-          const nextKey = generateRecoveryKey();
-          setRecoveryKey(nextKey);
-          appendLog("Recovery key rotated", "security", "New key generated");
-          addToast("New recovery key generated", "success", "Save it offline.");
-        }}
+        onRegenerate={handleRotateRecoveryKey}
       />
 
       <ExportBackupModal

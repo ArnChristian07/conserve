@@ -101,7 +101,7 @@ interface AccountModalProps {
   onSave: (
     data: Omit<GameAccount, "id" | "updatedAt" | "monogram">,
     editId?: string
-  ) => void;
+  ) => Promise<void>;
 }
 
 export function AccountModal({
@@ -141,6 +141,7 @@ function AccountModalContent({
   const [notes, setNotes] = useState(initialAccount?.notes ?? "");
   const [showPw, setShowPw] = useState(false);
   const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
 
   const strength = evaluatePasswordStrength(password);
   const isReused =
@@ -149,24 +150,36 @@ function AccountModalContent({
       (p) => p.password === password && p.id !== initialAccount?.id
     );
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (saving) return;
     if (!game.trim() || !nickname.trim() || !login.trim() || !password.trim()) {
       setError("Please fill in game, account nickname, login, and password.");
       return;
     }
-    onSave(
-      {
-        game: game.trim(),
-        nickname: nickname.trim(),
-        login: login.trim(),
-        password,
-        twoFactor,
-        notes: notes.trim() || undefined,
-      },
-      initialAccount?.id
-    );
-    onClose();
+    if (game.trim().length > 80 || nickname.trim().length > 80) {
+      setError("Game and nickname must be 80 characters or fewer.");
+      return;
+    }
+    setSaving(true);
+    try {
+      await onSave(
+        {
+          game: game.trim(),
+          nickname: nickname.trim(),
+          login: login.trim(),
+          password,
+          twoFactor,
+          notes: notes.trim() || undefined,
+        },
+        initialAccount?.id
+      );
+      onClose();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not save account.");
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -365,9 +378,10 @@ function AccountModalContent({
           </button>
           <button
             type="submit"
-            className="w-full sm:w-auto px-4 py-2.5 sm:py-2 rounded-xl bg-[#111111] text-white text-[13px] font-medium hover:bg-[#262626] active:scale-[0.98] transition-all cursor-pointer"
+            disabled={saving}
+            className="w-full sm:w-auto px-4 py-2.5 sm:py-2 rounded-xl bg-[#111111] text-white text-[13px] font-medium hover:bg-[#262626] active:scale-[0.98] transition-all cursor-pointer disabled:opacity-60 disabled:cursor-wait"
           >
-            {initialAccount ? "Save changes" : "Add to vault"}
+            {saving ? "Encrypting…" : initialAccount ? "Save changes" : "Add to vault"}
           </button>
         </div>
       </form>
@@ -439,7 +453,8 @@ export function DeleteAccountModal({
 interface ReauthModalProps {
   open: boolean;
   onClose: () => void;
-  expectedPassword: string;
+  /** Resolves true when the master password unlocks the vault key. */
+  onVerify: (masterPassword: string) => Promise<boolean>;
   onVerified: () => void;
   onInvalidAttempt: () => void;
 }
@@ -447,7 +462,7 @@ interface ReauthModalProps {
 export function ReauthModal({
   open,
   onClose,
-  expectedPassword,
+  onVerify,
   onVerified,
   onInvalidAttempt,
 }: ReauthModalProps) {
@@ -456,7 +471,7 @@ export function ReauthModal({
   return (
     <ReauthModalContent
       onClose={onClose}
-      expectedPassword={expectedPassword}
+      onVerify={onVerify}
       onVerified={onVerified}
       onInvalidAttempt={onInvalidAttempt}
     />
@@ -465,20 +480,25 @@ export function ReauthModal({
 
 function ReauthModalContent({
   onClose,
-  expectedPassword,
+  onVerify,
   onVerified,
   onInvalidAttempt,
 }: Omit<ReauthModalProps, "open">) {
   const [input, setInput] = useState("");
   const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (busy) return;
     if (!input) {
       setError("Enter your master password.");
       return;
     }
-    if (input !== expectedPassword) {
+    setBusy(true);
+    const ok = await onVerify(input);
+    setBusy(false);
+    if (!ok) {
       setError("Incorrect master password.");
       onInvalidAttempt();
       return;
@@ -497,12 +517,7 @@ function ReauthModalContent({
       <form onSubmit={handleSubmit} className="space-y-4">
         <div className="flex items-center gap-2.5 px-3 py-2.5 rounded-xl bg-[#F7F7F7] border border-[#EAEAEA] text-[12px] text-[#525252]">
           <LockIcon className="w-4 h-4 text-[#111111] shrink-0" />
-          <span>
-            Session master password:{" "}
-            <code className="font-mono font-semibold text-[#111111]">
-              {expectedPassword}
-            </code>
-          </span>
+          <span>Verified locally — your master password never leaves this device.</span>
         </div>
 
         <div>
@@ -533,9 +548,10 @@ function ReauthModalContent({
           </button>
           <button
             type="submit"
-            className="w-full sm:w-auto px-4 py-2.5 sm:py-2 rounded-xl bg-[#111111] text-white text-[13px] font-medium hover:bg-[#262626] active:scale-[0.98] transition-all cursor-pointer"
+            disabled={busy}
+            className="w-full sm:w-auto px-4 py-2.5 sm:py-2 rounded-xl bg-[#111111] text-white text-[13px] font-medium hover:bg-[#262626] active:scale-[0.98] transition-all cursor-pointer disabled:opacity-60 disabled:cursor-wait"
           >
-            Verify & reveal
+            {busy ? "Verifying…" : "Verify & reveal"}
           </button>
         </div>
       </form>
@@ -547,9 +563,10 @@ function ReauthModalContent({
 interface RecoveryKeyModalProps {
   open: boolean;
   onClose: () => void;
-  recoveryKey: string;
+  /** Only set right after the key is generated — it is never stored or re-shown. */
+  recoveryKey: string | null;
   onCopy: () => void;
-  onRegenerate: () => void;
+  onRegenerate: () => Promise<void>;
 }
 
 export function RecoveryKeyModal({
@@ -560,14 +577,27 @@ export function RecoveryKeyModal({
   onRegenerate,
 }: RecoveryKeyModalProps) {
   const [copied, setCopied] = useState(false);
+  const [rotating, setRotating] = useState(false);
+
+  const handleRegenerate = async () => {
+    if (rotating) return;
+    setRotating(true);
+    try {
+      await onRegenerate();
+    } finally {
+      setRotating(false);
+    }
+  };
 
   const handleCopy = () => {
+    if (!recoveryKey) return;
     onCopy();
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
 
   const handleDownload = () => {
+    if (!recoveryKey) return;
     const blob = new Blob(
       [
         `CONSERVE VAULT RECOVERY KEY\nGenerated: ${new Date().toISOString()}\n\nRecovery Key: ${recoveryKey}\n\nKeep this key offline in a safe place. It is the only way to recover your vault if you forget your master password.\n`,
@@ -590,15 +620,29 @@ export function RecoveryKeyModal({
       subtitle="Store this key offline. Anyone with this key can unlock your encrypted vault."
     >
       <div className="space-y-4">
-        <div className="p-3.5 sm:p-4 rounded-xl bg-[#111111] text-white font-mono text-[12.5px] sm:text-[14px] tracking-wider text-center select-all break-all border border-white/10">
-          {recoveryKey}
-        </div>
+        {recoveryKey ? (
+          <>
+            <div className="p-3.5 sm:p-4 rounded-xl bg-[#111111] text-white font-mono text-[12.5px] sm:text-[14px] tracking-wider text-center select-all break-all border border-white/10">
+              {recoveryKey}
+            </div>
+            <p className="text-[12px] text-[#737373]">
+              This is the only time this key is shown. Save it before closing.
+            </p>
+          </>
+        ) : (
+          <p className="p-3.5 sm:p-4 rounded-xl bg-[#F7F7F7] border border-[#EAEAEA] text-[12.5px] text-[#525252]">
+            Your recovery key isn&apos;t stored anywhere, so it can&apos;t be shown again.
+            If you&apos;ve lost it, rotate to generate a new one — the old key stops working
+            immediately.
+          </p>
+        )}
 
         <div className="grid grid-cols-2 sm:flex sm:flex-wrap items-center gap-2">
           <button
             type="button"
             onClick={handleCopy}
-            className="col-span-2 sm:flex-1 inline-flex items-center justify-center gap-1.5 px-3.5 py-2.5 sm:py-2 rounded-xl bg-[#111111] text-white text-[13px] font-medium hover:bg-[#262626] cursor-pointer"
+            disabled={!recoveryKey}
+            className="disabled:opacity-40 disabled:cursor-not-allowed col-span-2 sm:flex-1 inline-flex items-center justify-center gap-1.5 px-3.5 py-2.5 sm:py-2 rounded-xl bg-[#111111] text-white text-[13px] font-medium hover:bg-[#262626] cursor-pointer"
           >
             {copied ? (
               <>
@@ -613,16 +657,18 @@ export function RecoveryKeyModal({
           <button
             type="button"
             onClick={handleDownload}
-            className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2.5 sm:py-2 rounded-xl border border-[#E2E2E2] text-[13px] font-medium text-[#111111] hover:bg-[#F5F5F5] cursor-pointer"
+            disabled={!recoveryKey}
+            className="disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center justify-center gap-1.5 px-3.5 py-2.5 sm:py-2 rounded-xl border border-[#E2E2E2] text-[13px] font-medium text-[#111111] hover:bg-[#F5F5F5] cursor-pointer"
           >
             <DownloadIcon className="w-4 h-4" /> Save .txt
           </button>
           <button
             type="button"
-            onClick={onRegenerate}
-            className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2.5 sm:py-2 rounded-xl border border-[#E2E2E2] text-[13px] font-medium text-[#525252] hover:text-[#111111] hover:bg-[#F5F5F5] cursor-pointer"
+            onClick={handleRegenerate}
+            disabled={rotating}
+            className="disabled:opacity-60 disabled:cursor-wait inline-flex items-center justify-center gap-1.5 px-3.5 py-2.5 sm:py-2 rounded-xl border border-[#E2E2E2] text-[13px] font-medium text-[#525252] hover:text-[#111111] hover:bg-[#F5F5F5] cursor-pointer"
           >
-            Rotate
+            {rotating ? "Rotating…" : "Rotate"}
           </button>
         </div>
       </div>

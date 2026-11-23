@@ -3,46 +3,115 @@
 import React, { useState } from "react";
 import Image from "next/image";
 import { CheckIcon, EyeIcon, EyeOffIcon, LockIcon } from "./Icons";
+import { VaultError } from "../lib/vaultService";
 import { ToastVariant } from "../types/vault";
 
 interface AuthScreenProps {
-  expectedPassword: string;
-  expectedRecoveryKey: string;
   savedEmail: string;
-  onUnlock: (email: string, method: "password" | "recovery") => void;
-  onRegister: (email: string, password: string) => void;
+  onLogin: (email: string, masterPassword: string) => Promise<void>;
+  onRegister: (email: string, masterPassword: string) => Promise<"unlocked" | "confirm-email">;
+  onSendRecoveryCode: (email: string) => Promise<void>;
+  onRecover: (
+    email: string,
+    code: string,
+    recoveryKey: string,
+    newMasterPassword: string
+  ) => Promise<void>;
   onToast: (message: string, variant?: ToastVariant, detail?: string) => void;
 }
 
+const MIN_MASTER_PASSWORD = 8;
+const MAX_ATTEMPTS = 5;
+const LOCKOUT_MS = 15 * 60 * 1000;
+
+function isCredentialError(err: unknown): boolean {
+  return err instanceof VaultError && err.kind === "credentials";
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : "Something went wrong. Try again.";
+}
+
 export function AuthScreen({
-  expectedPassword,
-  expectedRecoveryKey,
   savedEmail,
-  onUnlock,
+  onLogin,
   onRegister,
+  onSendRecoveryCode,
+  onRecover,
   onToast,
 }: AuthScreenProps) {
   const [mode, setMode] = useState<"login" | "register">("login");
   const [useRecovery, setUseRecovery] = useState(false);
+  const [codeSent, setCodeSent] = useState(false);
+  const [busy, setBusy] = useState(false);
 
   const [email, setEmail] = useState(savedEmail);
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [recoveryInput, setRecoveryInput] = useState("");
-  const [trustDevice, setTrustDevice] = useState(false);
+  const [otpCode, setOtpCode] = useState("");
   const [showPassword, setShowPassword] = useState(false);
 
+  // UX-level throttle; the real limits are Supabase Auth's server-side rate limits.
   const [failedAttempts, setFailedAttempts] = useState(0);
   const [lockedUntil, setLockedUntil] = useState<number | null>(null);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const recordFailure = (err: unknown) => {
+    if (!isCredentialError(err)) {
+      onToast(errorMessage(err), "error");
+      return;
+    }
+    const next = failedAttempts + 1;
+    setFailedAttempts(next);
+    if (next >= MAX_ATTEMPTS) {
+      setLockedUntil(Date.now() + LOCKOUT_MS);
+      onToast("Sign-in locked for 15 minutes", "error", "5 consecutive failed attempts reached.");
+    } else {
+      onToast(
+        errorMessage(err),
+        "error",
+        `${MAX_ATTEMPTS - next} attempts remaining before 15-minute lockout.`
+      );
+    }
+  };
+
+  const validateNewPassword = (): boolean => {
+    if (password.length < MIN_MASTER_PASSWORD) {
+      onToast(
+        "Master password too short",
+        "error",
+        `Use at least ${MIN_MASTER_PASSWORD} characters to protect your vault.`
+      );
+      return false;
+    }
+    if (password !== confirmPassword) {
+      onToast("Master passwords do not match", "error");
+      return false;
+    }
+    return true;
+  };
+
+  const switchMode = (next: "login" | "register") => {
+    setMode(next);
+    setUseRecovery(false);
+    setCodeSent(false);
+    setPassword("");
+    setConfirmPassword("");
+  };
+
+  const toggleRecovery = (on: boolean) => {
+    setUseRecovery(on);
+    setCodeSent(false);
+    setPassword("");
+    setConfirmPassword("");
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (busy) return;
 
     if (lockedUntil !== null && Date.now() < lockedUntil) {
-      const minsLeft = Math.max(
-        1,
-        Math.ceil((lockedUntil - Date.now()) / 60000)
-      );
+      const minsLeft = Math.max(1, Math.ceil((lockedUntil - Date.now()) / 60000));
       onToast(
         "Sign-in temporarily locked",
         "error",
@@ -51,82 +120,75 @@ export function AuthScreen({
       return;
     }
 
-    const trimmedEmail = email.trim() || "you@example.com";
-
-    if (mode === "register") {
-      if (!email.trim() || !email.includes("@")) {
-        onToast("Enter a valid email address", "error");
-        return;
-      }
-      if (password.length < 8) {
-        onToast(
-          "Master password too short",
-          "error",
-          "Use at least 8 characters to protect your vault."
-        );
-        return;
-      }
-      if (password !== confirmPassword) {
-        onToast("Master passwords do not match", "error");
-        return;
-      }
-      onRegister(trimmedEmail, password);
+    const trimmedEmail = email.trim();
+    if (!trimmedEmail || !trimmedEmail.includes("@")) {
+      onToast("Enter a valid email address", "error");
       return;
     }
 
-    if (useRecovery) {
-      if (recoveryInput.trim().toUpperCase() !== expectedRecoveryKey) {
-        const next = failedAttempts + 1;
-        setFailedAttempts(next);
-        if (next >= 5) {
-          setLockedUntil(Date.now() + 15 * 60 * 1000);
+    setBusy(true);
+    try {
+      if (mode === "register") {
+        if (!validateNewPassword()) return;
+        const result = await onRegister(trimmedEmail, password);
+        if (result === "confirm-email") {
           onToast(
-            "Sign-in locked for 15 minutes",
-            "error",
-            "5 consecutive failed attempts reached."
+            "Check your inbox",
+            "info",
+            "Confirm your email, then log in with your master password."
           );
-        } else {
-          onToast(
-            "Invalid recovery key",
-            "error",
-            `${5 - next} attempts remaining before 15-minute lockout.`
-          );
+          switchMode("login");
         }
         return;
       }
-      setFailedAttempts(0);
-      onUnlock(trimmedEmail, "recovery");
-      return;
-    }
 
-    if (!password) {
-      onToast("Enter your master password", "error");
-      return;
-    }
-
-    if (password !== expectedPassword) {
-      const next = failedAttempts + 1;
-      setFailedAttempts(next);
-      if (next >= 5) {
-        setLockedUntil(Date.now() + 15 * 60 * 1000);
-        onToast(
-          "Sign-in locked for 15 minutes",
-          "error",
-          "5 consecutive failed attempts reached."
-        );
-      } else {
-        onToast(
-          "Incorrect master password",
-          "error",
-          `${5 - next} attempts remaining. Demo password: ${expectedPassword}`
-        );
+      if (useRecovery) {
+        if (!recoveryInput.trim()) {
+          onToast("Enter your recovery key", "error");
+          return;
+        }
+        if (!validateNewPassword()) return;
+        if (!codeSent) {
+          await onSendRecoveryCode(trimmedEmail);
+          setCodeSent(true);
+          onToast("Code sent", "info", `Enter the code emailed to ${trimmedEmail}.`);
+          return;
+        }
+        if (!otpCode.trim()) {
+          onToast("Enter the code from your email", "error");
+          return;
+        }
+        await onRecover(trimmedEmail, otpCode, recoveryInput, password);
+        setFailedAttempts(0);
+        return;
       }
-      return;
-    }
 
-    setFailedAttempts(0);
-    onUnlock(trimmedEmail, "password");
+      if (!password) {
+        onToast("Enter your master password", "error");
+        return;
+      }
+      await onLogin(trimmedEmail, password);
+      setFailedAttempts(0);
+    } catch (err) {
+      recordFailure(err);
+    } finally {
+      setBusy(false);
+    }
   };
+
+  const submitLabel = busy
+    ? mode === "register"
+      ? "Creating vault…"
+      : useRecovery && !codeSent
+      ? "Sending code…"
+      : "Unlocking…"
+    : mode === "register"
+    ? "Create & unlock vault"
+    : useRecovery
+    ? codeSent
+      ? "Recover vault"
+      : "Email me a code"
+    : "Unlock vault";
 
   return (
     <div className="min-h-screen w-full grid grid-cols-1 lg:grid-cols-2 bg-white animate-fade-slide-up">
@@ -193,10 +255,7 @@ export function AuthScreen({
           <div className="grid grid-cols-2 p-1 rounded-xl bg-[#F4F4F5] mb-6 sm:mb-8">
             <button
               type="button"
-              onClick={() => {
-                setMode("login");
-                setUseRecovery(false);
-              }}
+              onClick={() => switchMode("login")}
               className={`py-2.5 text-[13px] font-semibold rounded-lg transition-all cursor-pointer ${
                 mode === "login"
                   ? "bg-[#0D0D0D] text-white shadow-sm"
@@ -207,10 +266,7 @@ export function AuthScreen({
             </button>
             <button
               type="button"
-              onClick={() => {
-                setMode("register");
-                setUseRecovery(false);
-              }}
+              onClick={() => switchMode("register")}
               className={`py-2.5 text-[13px] font-semibold rounded-lg transition-all cursor-pointer ${
                 mode === "register"
                   ? "bg-[#0D0D0D] text-white shadow-sm"
@@ -228,7 +284,7 @@ export function AuthScreen({
             <p className="text-[13.5px] text-[#737373] mt-1">
               {mode === "login"
                 ? useRecovery
-                  ? "Enter your 24-character recovery key to unlock."
+                  ? "Use your recovery key to set a new master password."
                   : "Unlock your vault with your master password."
                 : "Set a master password to encrypt your game accounts."}
             </p>
@@ -241,6 +297,7 @@ export function AuthScreen({
               </label>
               <input
                 type="email"
+                autoComplete="email"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 placeholder="you@example.com"
@@ -248,7 +305,7 @@ export function AuthScreen({
               />
             </div>
 
-            {mode === "login" && useRecovery ? (
+            {mode === "login" && useRecovery && (
               <div>
                 <div className="flex items-center justify-between mb-1.5">
                   <label className="text-[12.5px] font-semibold text-[#111111]">
@@ -256,7 +313,7 @@ export function AuthScreen({
                   </label>
                   <button
                     type="button"
-                    onClick={() => setUseRecovery(false)}
+                    onClick={() => toggleRecovery(false)}
                     className="text-[12px] text-[#525252] underline underline-offset-2 hover:text-[#111111] cursor-pointer py-0.5"
                   >
                     Use master password
@@ -270,16 +327,17 @@ export function AuthScreen({
                   className="w-full h-11 px-3.5 rounded-xl border border-[#E2E2E2] bg-white font-mono text-[16px] sm:text-[13px] text-[#111111] placeholder:text-[#A3A3A3] focus:outline-none focus:border-[#111111] transition-colors"
                 />
               </div>
-            ) : (
-              <div>
+            )}
+
+            <div>
                 <div className="flex items-center justify-between mb-1.5">
                   <label className="text-[12.5px] font-semibold text-[#111111]">
-                    Master password
+                    {useRecovery ? "New master password" : "Master password"}
                   </label>
-                  {mode === "login" && (
+                  {mode === "login" && !useRecovery && (
                     <button
                       type="button"
-                      onClick={() => setUseRecovery(true)}
+                      onClick={() => toggleRecovery(true)}
                       className="text-[12px] text-[#525252] underline underline-offset-2 hover:text-[#111111] cursor-pointer py-0.5"
                     >
                       Use recovery key
@@ -291,10 +349,11 @@ export function AuthScreen({
                     type={showPassword ? "text" : "password"}
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
+                    autoComplete={mode === "login" && !useRecovery ? "current-password" : "new-password"}
                     placeholder={
-                      mode === "login"
-                        ? `Enter master password (${expectedPassword})`
-                        : "At least 8 characters"
+                      mode === "login" && !useRecovery
+                        ? "Enter master password"
+                        : `At least ${MIN_MASTER_PASSWORD} characters`
                     }
                     className="w-full h-11 pl-3.5 pr-11 rounded-xl border border-[#E2E2E2] bg-white text-[16px] sm:text-[14px] text-[#111111] placeholder:text-[#B5B5B5] focus:outline-none focus:border-[#111111] transition-colors"
                   />
@@ -311,41 +370,48 @@ export function AuthScreen({
                     )}
                   </button>
                 </div>
-              </div>
-            )}
+            </div>
 
-            {mode === "register" && (
+            {(mode === "register" || useRecovery) && (
               <div>
                 <label className="block text-[12.5px] font-semibold text-[#111111] mb-1.5">
-                  Confirm master password
+                  {useRecovery ? "Confirm new master password" : "Confirm master password"}
                 </label>
                 <input
                   type={showPassword ? "text" : "password"}
                   value={confirmPassword}
                   onChange={(e) => setConfirmPassword(e.target.value)}
+                  autoComplete="new-password"
                   placeholder="Re-enter master password"
                   className="w-full h-11 px-3.5 rounded-xl border border-[#E2E2E2] bg-white text-[16px] sm:text-[14px] text-[#111111] placeholder:text-[#B5B5B5] focus:outline-none focus:border-[#111111] transition-colors"
                 />
               </div>
             )}
 
-            <label className="flex items-center gap-2.5 pt-1 cursor-pointer select-none">
-              <input
-                type="checkbox"
-                checked={trustDevice}
-                onChange={(e) => setTrustDevice(e.target.checked)}
-                className="w-4 h-4 rounded border-[#D4D4D8] accent-[#0D0D0D] cursor-pointer"
-              />
-              <span className="text-[13px] text-[#525252]">
-                Trust this device for 30 days
-              </span>
-            </label>
+            {mode === "login" && useRecovery && codeSent && (
+              <div>
+                <label className="block text-[12.5px] font-semibold text-[#111111] mb-1.5">
+                  Code from your email
+                </label>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  value={otpCode}
+                  onChange={(e) => setOtpCode(e.target.value)}
+                  placeholder="6-digit code"
+                  className="w-full h-11 px-3.5 rounded-xl border border-[#E2E2E2] bg-white font-mono tracking-widest text-[16px] sm:text-[14px] text-[#111111] placeholder:text-[#A3A3A3] placeholder:tracking-normal focus:outline-none focus:border-[#111111] transition-colors"
+                />
+              </div>
+            )}
 
             <button
               type="submit"
-              className="w-full h-11 rounded-xl bg-[#0D0D0D] text-white text-[13.5px] font-semibold hover:bg-[#222222] active:scale-[0.99] transition-all cursor-pointer"
+              disabled={busy}
+              aria-busy={busy}
+              className="w-full h-11 rounded-xl bg-[#0D0D0D] text-white text-[13.5px] font-semibold hover:bg-[#222222] active:scale-[0.99] transition-all cursor-pointer disabled:opacity-60 disabled:cursor-wait"
             >
-              {mode === "login" ? "Unlock vault" : "Create & unlock vault"}
+              {submitLabel}
             </button>
           </form>
 
