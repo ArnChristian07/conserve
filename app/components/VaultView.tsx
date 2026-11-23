@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useMemo, useState } from "react";
-import { formatRelativeTime } from "../data/initialVault";
+import { formatRelativeTime } from "../lib/vaultUtils";
 import { GameAccount, VaultHealthSummary } from "../types/vault";
 import {
   CheckIcon,

@@ -5,7 +5,7 @@ import {
   evaluatePasswordStrength,
   generateMonogram,
   generateStrongPassword,
-} from "../data/initialVault";
+} from "../lib/vaultUtils";
 import { GameAccount } from "../types/vault";
 import {
   AlertTriangleIcon,

@@ -1,182 +1,7 @@
-import {
-  AuditLogEntry,
-  GameAccount,
-  SecuritySettings,
-  SignedInDevice,
-  VaultHealthSummary,
-  VaultIssue,
-} from "../types/vault";
+import { randomIndex } from "./crypto";
+import { GameAccount, VaultHealthSummary, VaultIssue } from "../types/vault";
 
 const DAY = 24 * 60 * 60 * 1000;
-const NOW = Date.now();
-
-export const INITIAL_ACCOUNTS: GameAccount[] = [
-  {
-    id: "acc-1",
-    game: "Genshin Impact",
-    monogram: "GI",
-    nickname: "Main · Asia server",
-    login: "traveler.main@example.com",
-    password: "Teyvat#Archon99!Asia",
-    twoFactor: true,
-    updatedAt: NOW - 2 * DAY,
-    notes: "AR 60 · Primary Hoyoverse account",
-  },
-  {
-    id: "acc-2",
-    game: "Genshin Impact",
-    monogram: "GI",
-    nickname: "Alt · reroll",
-    login: "traveler.alt@example.com",
-    password: "gamer1234",
-    twoFactor: false,
-    updatedAt: NOW - 150 * DAY,
-    notes: "Reroll alt account",
-  },
-  {
-    id: "acc-3",
-    game: "Valorant",
-    monogram: "V",
-    nickname: "Ranked main",
-    login: "nightowl_ph",
-    password: "Vandal$Clutch2026!",
-    twoFactor: true,
-    updatedAt: NOW - 21 * DAY,
-    notes: "APAC server",
-  },
-  {
-    id: "acc-4",
-    game: "Mobile Legends",
-    monogram: "ML",
-    nickname: "Moonton · Mythic",
-    login: "ml.player@example.com",
-    password: "gamer1234",
-    twoFactor: false,
-    updatedAt: NOW - 30 * DAY,
-    notes: "Moonton bind",
-  },
-  {
-    id: "acc-5",
-    game: "Steam",
-    monogram: "S",
-    nickname: "Library",
-    login: "deck_user",
-    password: "SteamDeck@Vault42#",
-    twoFactor: true,
-    updatedAt: NOW - 1 * DAY,
-    notes: "Steam Guard mobile authenticator active",
-  },
-  {
-    id: "acc-6",
-    game: "Honkai: Star Rail",
-    monogram: "HS",
-    nickname: "Trailblazer",
-    login: "trail.blazer@example.com",
-    password: "astraltrain",
-    twoFactor: false,
-    updatedAt: NOW - 60 * DAY,
-    notes: "Express pass active",
-  },
-  {
-    id: "acc-7",
-    game: "Minecraft",
-    monogram: "M",
-    nickname: "Microsoft account",
-    login: "blocky.builder@example.com",
-    password: "Netherite!Pickaxe77",
-    twoFactor: true,
-    updatedAt: NOW - 7 * DAY,
-    notes: "Java + Bedrock edition",
-  },
-];
-
-export const INITIAL_SETTINGS: SecuritySettings = {
-  reenterToReveal: true,
-  clearClipboard: true,
-  lockOnTabClose: true,
-  twoStepLogin: true,
-  emailNewSignIns: false,
-  autoLockMinutes: 15,
-};
-
-export const INITIAL_DEVICES: SignedInDevice[] = [
-  {
-    id: "dev-1",
-    name: "Chrome on Windows",
-    location: "Quezon City, PH",
-    lastActive: "active now",
-    isCurrent: true,
-  },
-  {
-    id: "dev-2",
-    name: "Conserve for Android",
-    location: "Quezon City, PH",
-    lastActive: "3 hours ago",
-    isCurrent: false,
-  },
-  {
-    id: "dev-3",
-    name: "Firefox on Linux",
-    location: "Manila, PH",
-    lastActive: "6 days ago",
-    isCurrent: false,
-  },
-];
-
-export const INITIAL_AUDIT_LOGS: AuditLogEntry[] = [
-  {
-    id: "log-1",
-    timestampLabel: "Today 19:42",
-    createdAt: NOW - 15 * 60 * 1000,
-    action: "Password revealed",
-    target: "Valorant — Ranked main",
-    device: "Chrome on Windows",
-    location: "Quezon City, PH",
-    category: "access",
-  },
-  {
-    id: "log-2",
-    timestampLabel: "Today 19:40",
-    createdAt: NOW - 17 * 60 * 1000,
-    action: "Vault unlocked",
-    target: "Two-step verified",
-    device: "Chrome on Windows",
-    location: "Quezon City, PH",
-    category: "security",
-  },
-  {
-    id: "log-3",
-    timestampLabel: "Yesterday",
-    createdAt: NOW - 1 * DAY,
-    action: "Account edited",
-    target: "Steam — Library",
-    device: "Conserve for Android",
-    location: "Quezon City, PH",
-    category: "account",
-  },
-  {
-    id: "log-4",
-    timestampLabel: "3 days ago",
-    createdAt: NOW - 3 * DAY,
-    action: "Account added",
-    target: "Minecraft — Microsoft account",
-    device: "Chrome on Windows",
-    location: "Quezon City, PH",
-    category: "account",
-  },
-  {
-    id: "log-5",
-    timestampLabel: "6 days ago",
-    createdAt: NOW - 6 * DAY,
-    action: "New device signed in",
-    target: "Firefox on Linux",
-    device: "Firefox on Linux",
-    location: "Manila, PH",
-    category: "device",
-  },
-];
-
-export const INITIAL_RECOVERY_KEY = "CNSV-9K4M-7P2X-4W8Q-6R3N-5T9V";
 
 export function generateMonogram(game: string): string {
   const cleaned = game.replace(/[:\-]/g, " ").trim();
@@ -345,32 +170,31 @@ export function generateStrongPassword(length = 16): string {
   const symbols = "!@#$%^&*-_";
   const all = upper + lower + digits + symbols;
   const required = [
-    upper[Math.floor(Math.random() * upper.length)],
-    lower[Math.floor(Math.random() * lower.length)],
-    digits[Math.floor(Math.random() * digits.length)],
-    symbols[Math.floor(Math.random() * symbols.length)],
+    upper[randomIndex(upper.length)],
+    lower[randomIndex(lower.length)],
+    digits[randomIndex(digits.length)],
+    symbols[randomIndex(symbols.length)],
   ];
   const rest = Array.from({ length: length - required.length }, () =>
-    all[Math.floor(Math.random() * all.length)]
+    all[randomIndex(all.length)]
   );
   const chars = [...required, ...rest];
   for (let i = chars.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
+    const j = randomIndex(i + 1);
     [chars[i], chars[j]] = [chars[j], chars[i]];
   }
   return chars.join("");
 }
 
-export function generateRecoveryKey(): string {
-  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  const block = () =>
-    Array.from({ length: 4 }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join("");
-  return `CNSV-${block()}-${block()}-${block()}-${block()}-${block()}`;
-}
-
-export function formatCurrentTimestampLabel(): string {
-  const d = new Date();
-  const hh = String(d.getHours()).padStart(2, "0");
-  const mm = String(d.getMinutes()).padStart(2, "0");
-  return `Today ${hh}:${mm}`;
+/** "Today 19:42" · "Yesterday 08:10" · "3 days ago" · "12 Oct 2026" */
+export function formatLogTimestamp(createdAt: number, now = Date.now()): string {
+  const d = new Date(createdAt);
+  const time = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  const startOfToday = new Date(now);
+  startOfToday.setHours(0, 0, 0, 0);
+  const dayDiff = Math.floor((startOfToday.getTime() - createdAt) / DAY) + 1;
+  if (createdAt >= startOfToday.getTime()) return `Today ${time}`;
+  if (dayDiff <= 1) return `Yesterday ${time}`;
+  if (dayDiff < 7) return `${dayDiff} days ago`;
+  return d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
 }
